@@ -8,7 +8,6 @@
   Democracy of Experts
 ```
 
-<h3 align="center">the 5th element.</h3>
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
 > *Inference architecture with a living LoRA parliament, Hebbian plasticity, and physics. Indexes any GGUF read-only. No training loop. No backward pass. The organism learns by living.*
