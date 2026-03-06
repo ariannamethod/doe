@@ -1,2 +1,1 @@
-# doe
-DoE Janus Architecture: Democracy of Experts
+# DoE Janus Architecture: Democracy of Experts
