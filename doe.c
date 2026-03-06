@@ -637,7 +637,7 @@ static void softmax_n(float *x, int n) {
 }
 
 static void apply_rope(float *v, int pos, float *cc, float *sc, int hd) {
-    int h = hd/2, off = pos*h;
+    int h = hd/2, off = pos*h; /* hd must be even — all standard archs are */
     for (int i = 0; i < h; i++) {
         float x0 = v[i], x1 = v[i+h];
         v[i] = x0*cc[off+i] - x1*sc[off+i];
@@ -1281,26 +1281,44 @@ static int parliament_elect(Parliament *p, LoraExpert *experts, float *input, in
  * no backprop. synapse strengthens from co-activation.
  * signal-gated: prophecy debt drives learning direction.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+static int notorch_offset = 0; /* rotating window into LoRA rank */
+
 static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
                          const float *x, const float *dy, float signal) {
     if (fabsf(signal) < 1e-8f) return;
     float lr = F.notorch_lr * signal;
+    /* NOTORCH operates at rank 4 but rotates across all LORA_RANK components.
+     * each call updates 4 components starting at notorch_offset.
+     * after rank/4 calls, every component has been updated once. */
+    int nr = NOTORCH_RANK;
+    if (nr > rank) nr = rank;
+    int base = notorch_offset % rank;
     float u[NOTORCH_RANK];
-    for (int r = 0; r < rank && r < NOTORCH_RANK; r++) {
+    for (int j = 0; j < nr; j++) {
+        int r = (base + j) % rank;
         float s = 0;
         for (int i = 0; i < out_dim && i < in_dim; i++) s += B[i * rank + r] * dy[i];
-        u[r] = s + rand_normal() * 0.01f;
+        u[j] = s + rand_normal() * 0.01f;
     }
 #ifdef USE_BLAS
-    for (int r = 0; r < rank && r < NOTORCH_RANK; r++)
-        cblas_saxpy(in_dim, lr * u[r], x, 1, A + r, rank);
+    for (int j = 0; j < nr; j++) {
+        int r = (base + j) % rank;
+        cblas_saxpy(in_dim, lr * u[j], x, 1, A + r, rank);
+    }
 #else
     for (int i = 0; i < in_dim; i++)
-        for (int r = 0; r < rank && r < NOTORCH_RANK; r++)
-            A[i * rank + r] += lr * x[i] * u[r];
+        for (int j = 0; j < nr; j++) {
+            int r = (base + j) % rank;
+            A[i * rank + r] += lr * x[i] * u[j];
+        }
 #endif
+    /* decay only the components we touched */
     float decay = F.notorch_decay;
-    for (int i = 0; i < out_dim * rank; i++) B[i] *= decay;
+    for (int j = 0; j < nr; j++) {
+        int r = (base + j) % rank;
+        for (int i = 0; i < out_dim; i++) B[i * rank + r] *= decay;
+    }
+    notorch_offset = (base + nr) % rank;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1491,6 +1509,110 @@ static void mycelium_init(MyceliumState *ms) {
     mkdir(MYCELIUM_DIR, 0755);
 }
 
+static void mycelium_save(Symbiont *ps, int step, float fitness) {
+    char path[256];
+    snprintf(path, 256, "%s/spore_%016llx_s%d.bin", MYCELIUM_DIR,
+             (unsigned long long)ps->profile.fingerprint, step);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("[mycelium] cannot write %s\n", path); return; }
+    /* header: fingerprint, step, fitness, n_layers, dim, rank */
+    uint64_t fp = ps->profile.fingerprint;
+    fwrite(&fp, 8, 1, f);
+    fwrite(&step, 4, 1, f);
+    fwrite(&fitness, 4, 1, f);
+    int nl = ps->n_field_layers, dim = ps->host_dim, rank = ps->lora_rank;
+    fwrite(&nl, 4, 1, f); fwrite(&dim, 4, 1, f); fwrite(&rank, 4, 1, f);
+    /* per layer: n_alive, then per expert: alive, vitality, frequency, A, B */
+    for (int l = 0; l < nl; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        fwrite(&fl->n_alive, 4, 1, f);
+        /* parliament vote weights */
+        fwrite(fl->parliament.w_vote, sizeof(float), MAX_EXPERTS * dim, f);
+        fwrite(&fl->parliament.consensus, 4, 1, f);
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            LoraExpert *ex = &fl->experts[e];
+            fwrite(&ex->alive, 4, 1, f);
+            if (ex->alive) {
+                fwrite(&ex->vitality, 4, 1, f);
+                fwrite(&ex->frequency, 4, 1, f);
+                fwrite(ex->lora_A, sizeof(float), dim * rank, f);
+                fwrite(ex->lora_B, sizeof(float), rank * dim, f);
+            }
+        }
+    }
+    fclose(f);
+    printf("[mycelium] spore saved: %s (fitness=%.3f)\n", path, fitness);
+}
+
+static int mycelium_load(Symbiont *ps, uint64_t target_fp) {
+    /* scan directory for best matching spore */
+    char pattern[256];
+    snprintf(pattern, 256, "%s/spore_%016llx_*.bin", MYCELIUM_DIR, (unsigned long long)target_fp);
+    /* simple scan: find newest (highest step) spore for this fingerprint */
+    char best_path[256] = {0};
+    int best_step = -1;
+    FILE *p = popen("ls " MYCELIUM_DIR "/ 2>/dev/null", "r");
+    if (!p) return 0;
+    char line[256];
+    while (fgets(line, sizeof(line), p)) {
+        int len = strlen(line);
+        while (len > 0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len] = '\0';
+        /* match fingerprint */
+        char want[32]; snprintf(want, 32, "spore_%016llx", (unsigned long long)target_fp);
+        if (!strstr(line, want)) continue;
+        /* extract step from filename */
+        char *sp = strstr(line, "_s");
+        if (!sp) continue;
+        int s = atoi(sp+2);
+        if (s > best_step) {
+            best_step = s;
+            snprintf(best_path, 256, "%s/%s", MYCELIUM_DIR, line);
+        }
+    }
+    pclose(p);
+    if (best_step < 0) return 0;
+
+    FILE *f = fopen(best_path, "rb");
+    if (!f) return 0;
+    uint64_t fp; fread(&fp, 8, 1, f);
+    if (fp != target_fp) { fclose(f); return 0; }
+    int step; float fitness;
+    fread(&step, 4, 1, f); fread(&fitness, 4, 1, f);
+    int nl, dim, rank;
+    fread(&nl, 4, 1, f); fread(&dim, 4, 1, f); fread(&rank, 4, 1, f);
+    if (nl != ps->n_field_layers || dim != ps->host_dim || rank != ps->lora_rank) {
+        printf("[mycelium] spore mismatch (layers=%d/%d dim=%d/%d rank=%d/%d)\n",
+               nl, ps->n_field_layers, dim, ps->host_dim, rank, ps->lora_rank);
+        fclose(f); return 0;
+    }
+    for (int l = 0; l < nl; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        fread(&fl->n_alive, 4, 1, f);
+        fread(fl->parliament.w_vote, sizeof(float), MAX_EXPERTS * dim, f);
+        fread(&fl->parliament.consensus, 4, 1, f);
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            LoraExpert *ex = &fl->experts[e];
+            int alive; fread(&alive, 4, 1, f);
+            if (alive) {
+                if (!ex->alive) {
+                    ex->lora_A = calloc(dim * rank, sizeof(float));
+                    ex->lora_B = calloc(rank * dim, sizeof(float));
+                }
+                ex->alive = 1;
+                fread(&ex->vitality, 4, 1, f);
+                fread(&ex->frequency, 4, 1, f);
+                fread(ex->lora_A, sizeof(float), dim * rank, f);
+                fread(ex->lora_B, sizeof(float), rank * dim, f);
+            } else if (ex->alive) {
+                free_lora_expert(ex);
+            }
+        }
+    }
+    fclose(f);
+    printf("[mycelium] spore loaded: %s (step=%d fitness=%.3f)\n", best_path, step, fitness);
+    return 1;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SYMBIONT FORWARD — run token through host with DOE modulation.
  *
@@ -1543,6 +1665,16 @@ static InferState alloc_infer(Symbiont *ps, int max_seq) {
             s.sin_cache[p*half+i] = sinf(ang);
         }
     return s;
+}
+
+static void free_infer(InferState *s) {
+    free(s->x); free(s->xb); free(s->xb2);
+    free(s->q); free(s->k); free(s->v);
+    free(s->att); free(s->logits);
+    free(s->hb); free(s->hb2); free(s->expert_out);
+    free(s->key_cache); free(s->value_cache);
+    free(s->cos_cache); free(s->sin_cache);
+    memset(s, 0, sizeof(InferState));
 }
 
 static float *symbiont_forward(Symbiont *ps, InferState *s, int token, int pos) {
@@ -1789,6 +1921,7 @@ static void chat(Symbiont *ps) {
             printf("  [life] births=%d deaths=%d\n", total_births, total_deaths);
         printf("\n");
     }
+    free_infer(&is);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1835,18 +1968,15 @@ int main(int argc, char **argv) {
 
     /* ── Find host GGUF ── */
     if (gguf_path[0] == '\0') {
-        /* Auto-detect: pick largest non-DOE GGUF */
-        int best = -1; int64_t best_size = 0;
+        /* Auto-detect: pick first non-mycelium GGUF — size doesn't matter */
+        int best = -1;
         for (int i = 0; i < env.n_ggufs; i++) {
             if (strstr(env.ggufs[i].path, "mycelium/")) continue;
-            if (env.ggufs[i].file_size > best_size) {
-                best_size = env.ggufs[i].file_size;
-                best = i;
-            }
+            best = i; break;
         }
         if (best >= 0) {
             snprintf(gguf_path, 256, "%s", env.ggufs[best].path);
-            printf("[auto] selected host: %s (%.1fMB)\n", gguf_path, (float)best_size/(1024*1024));
+            printf("[auto] indexing: %s (%.1fMB)\n", gguf_path, (float)env.ggufs[best].file_size/(1024*1024));
         } else {
             fprintf(stderr, "[error] no GGUF found. use --model PATH or place a .gguf nearby.\n");
             return 1;
@@ -1863,10 +1993,14 @@ int main(int argc, char **argv) {
     /* ── Mycelium — check for existing LoRA spores ── */
     MyceliumState mycelium;
     mycelium_init(&mycelium);
-    /* TODO: load best matching spore for this host fingerprint */
+    if (mycelium_load(&symbiont, symbiont.profile.fingerprint))
+        printf("[mycelium] resumed adaptation for this index.\n");
 
     /* ── Chat ── */
     chat(&symbiont);
+
+    /* ── Save spore on exit ── */
+    mycelium_save(&symbiont, F.step, F.field_health);
 
     /* ── Cleanup ── */
     symbiont_free(&symbiont);
