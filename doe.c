@@ -843,6 +843,10 @@ typedef struct {
 
     /* Active flag */
     int active;
+
+    /* f16→f32 conversion buffers (must be freed on cleanup) */
+    float **f16_bufs;
+    int     n_f16_bufs;
 } Symbiont;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
@@ -871,23 +875,42 @@ static int gguf_sniff(const char *path, DiscoveredGGUF *out) {
     uint32_t magic; if (fread(&magic, 4, 1, f) != 1 || magic != 0x46554747) { fclose(f); return 0; }
     uint32_t version; fread(&version, 4, 1, f);
     uint64_t n_tensors, n_kv; fread(&n_tensors, 8, 1, f); fread(&n_kv, 8, 1, f);
-    for (uint64_t i = 0; i < n_kv && i < 64; i++) {
+    for (uint64_t i = 0; i < n_kv; i++) {
         uint64_t klen; if (fread(&klen, 8, 1, f) != 1) break;
-        if (klen > 255) break;
+        if (klen > 255) { fseek(f, klen + 4, SEEK_CUR); continue; }
         char key[256]; if (fread(key, 1, klen, f) != klen) break; key[klen] = '\0';
         uint32_t vtype; if (fread(&vtype, 4, 1, f) != 1) break;
-        if (vtype == 8) { uint64_t vlen; fread(&vlen, 8, 1, f); char val[256];
-            int rl = vlen < 255 ? (int)vlen : 255; fread(val, 1, rl, f); val[rl] = '\0';
+        if (vtype == 8) { /* string */
+            uint64_t vlen; fread(&vlen, 8, 1, f);
+            char val[256]; int rl = vlen < 255 ? (int)vlen : 255;
+            fread(val, 1, rl, f); val[rl] = '\0';
             if (vlen > 255) fseek(f, vlen-255, SEEK_CUR);
             if (strstr(key, "general.architecture")) snprintf(out->arch, 64, "%s", val);
         } else if (vtype == 4) { uint32_t val; fread(&val, 4, 1, f);
             if (strstr(key, "embedding_length")) out->dim = (int)val;
             else if (strstr(key, "block_count")) out->n_layers = (int)val;
             else if (strstr(key, "head_count") && !strstr(key, "kv")) out->n_heads = (int)val;
-        } else if (vtype == 5 || vtype == 6) fseek(f, 4, SEEK_CUR);
-        else if (vtype == 10) fseek(f, 8, SEEK_CUR);
-        else if (vtype == 7) fseek(f, 1, SEEK_CUR);
-        else break;
+        } else if (vtype == 0 || vtype == 1 || vtype == 7) fseek(f, 1, SEEK_CUR);
+        else if (vtype == 2 || vtype == 3) fseek(f, 2, SEEK_CUR);
+        else if (vtype == 5 || vtype == 6) fseek(f, 4, SEEK_CUR);
+        else if (vtype == 10 || vtype == 11 || vtype == 12) fseek(f, 8, SEEK_CUR);
+        else if (vtype == 9) { /* array */
+            uint32_t atype; fread(&atype, 4, 1, f);
+            uint64_t alen; fread(&alen, 8, 1, f);
+            size_t esz = 0;
+            if (atype == 0 || atype == 1 || atype == 7) esz = 1;
+            else if (atype == 2 || atype == 3) esz = 2;
+            else if (atype == 4 || atype == 5 || atype == 6) esz = 4;
+            else if (atype == 10 || atype == 11 || atype == 12) esz = 8;
+            else if (atype == 8) {
+                for (uint64_t ai = 0; ai < alen; ai++) {
+                    uint64_t sl; if (fread(&sl, 8, 1, f) != 1) break;
+                    fseek(f, sl, SEEK_CUR);
+                }
+                continue;
+            }
+            fseek(f, alen * esz, SEEK_CUR);
+        } else fseek(f, 4, SEEK_CUR); /* unknown — guess 4 */
     }
     fclose(f);
     return (out->arch[0] != '\0' && out->dim > 0);
@@ -976,25 +999,49 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     PC(8); uint64_t n_tensors = *(uint64_t*)p; p += 8;
     PC(8); uint64_t n_kv = *(uint64_t*)p; p += 8;
 
-    for (uint64_t i = 0; i < n_kv && i < 64; i++) {
+    for (uint64_t i = 0; i < n_kv; i++) {
         PC(8); uint64_t klen = *(uint64_t*)p; p += 8;
-        if (klen > 255) break;
+        if (klen > 255) { p += klen + 4; continue; } /* skip long keys */
         char key[256]; memcpy(key, p, klen); key[klen] = '\0'; p += klen;
-        uint32_t vtype = *(uint32_t*)p; p += 4;
-        if (vtype == 8) { uint64_t vlen = *(uint64_t*)p; p += 8;
-            if (vlen < 64) { memcpy(ps->host_arch, p, vlen); ps->host_arch[vlen] = 0; }
+        PC(4); uint32_t vtype = *(uint32_t*)p; p += 4;
+        if (vtype == 8) { /* string */
+            PC(8); uint64_t vlen = *(uint64_t*)p; p += 8;
+            if (strstr(key, "general.architecture") && vlen < 64) {
+                memcpy(ps->host_arch, p, vlen); ps->host_arch[vlen] = 0;
+            }
             p += vlen;
-        } else if (vtype == 4) { uint32_t val = *(uint32_t*)p; p += 4;
+        } else if (vtype == 4) { /* uint32 */
+            PC(4); uint32_t val = *(uint32_t*)p; p += 4;
             if (strstr(key, "embedding_length")) ps->host_dim = (int)val;
             else if (strstr(key, "block_count")) ps->host_n_layers = (int)val;
             else if (strstr(key, "head_count") && !strstr(key, "kv")) ps->host_heads = (int)val;
             else if (strstr(key, "head_count_kv")) ps->host_kv_heads = (int)val;
             else if (strstr(key, "feed_forward_length")) ps->host_hidden = (int)val;
             else if (strstr(key, "vocab_size")) ps->host_vocab = (int)val;
-        } else if (vtype == 5 || vtype == 6) p += 4;
-        else if (vtype == 10) p += 8;
-        else if (vtype == 7) p += 1;
-        else break;
+        } else if (vtype == 0 || vtype == 7) p += 1;           /* uint8, bool */
+        else if (vtype == 1) p += 1;                            /* int8 */
+        else if (vtype == 2 || vtype == 3) p += 2;             /* uint16, int16 */
+        else if (vtype == 5 || vtype == 6) p += 4;             /* int32, float32 */
+        else if (vtype == 10 || vtype == 11 || vtype == 12) p += 8; /* uint64, int64, float64 */
+        else if (vtype == 9) { /* array */
+            PC(4); uint32_t atype = *(uint32_t*)p; p += 4;
+            PC(8); uint64_t alen = *(uint64_t*)p; p += 8;
+            /* skip array elements */
+            size_t elem_sz = 0;
+            if (atype == 0 || atype == 1 || atype == 7) elem_sz = 1;
+            else if (atype == 2 || atype == 3) elem_sz = 2;
+            else if (atype == 4 || atype == 5 || atype == 6) elem_sz = 4;
+            else if (atype == 10 || atype == 11 || atype == 12) elem_sz = 8;
+            else if (atype == 8) {
+                /* array of strings — skip one by one */
+                for (uint64_t ai = 0; ai < alen && p < pend; ai++) {
+                    PC(8); uint64_t slen = *(uint64_t*)p; p += 8;
+                    p += slen;
+                }
+                continue;
+            }
+            p += alen * elem_sz;
+        } else { p += 4; } /* unknown — guess 4 bytes, best effort */
     }
     if (ps->host_dim == 0 || ps->host_n_layers == 0) goto bail;
     if (ps->host_heads == 0) ps->host_heads = ps->host_dim / 64;
@@ -1020,11 +1067,44 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     uint64_t header_size = p - ps->mmap_base;
     uint64_t data_start = ((header_size + 31) / 32) * 32;
 
+    /* f16→f32 conversion buffers — tracked in Symbiont for cleanup */
+    ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
+
     /* Wire weight pointers */
     int wired = 0;
     for (uint64_t i = 0; i < n_tensors; i++) {
-        if (tinfo[i].dtype != 0) continue; /* only float32 */
-        float *data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
+        if (tinfo[i].dtype != 0 && tinfo[i].dtype != 1) continue; /* f32 or f16 only */
+        float *data;
+        if (tinfo[i].dtype == 0) {
+            data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
+        } else {
+            /* f16 → f32 conversion */
+            uint64_t n_elems = 1;
+            for (uint32_t d = 0; d < tinfo[i].ndim; d++) n_elems *= tinfo[i].dims[d];
+            data = malloc(n_elems * sizeof(float));
+            uint16_t *src = (uint16_t*)(ps->mmap_base + data_start + tinfo[i].offset);
+            for (uint64_t j = 0; j < n_elems; j++) {
+                /* IEEE 754 half→float */
+                uint16_t h = src[j];
+                uint32_t sign = (h >> 15) & 1;
+                uint32_t exp = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) f = sign << 31;
+                    else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                           mant &= 0x3FF; f = (sign<<31)|((exp+127-15)<<23)|(mant<<13); }
+                } else if (exp == 31) {
+                    f = (sign<<31)|0x7F800000|(mant<<13);
+                } else {
+                    f = (sign<<31)|((exp+127-15)<<23)|(mant<<13);
+                }
+                memcpy(&data[j], &f, 4);
+            }
+            /* track for cleanup */
+            ps->f16_bufs = realloc(ps->f16_bufs, (ps->n_f16_bufs+1)*sizeof(float*));
+            ps->f16_bufs[ps->n_f16_bufs++] = data;
+        }
         char *n = tinfo[i].name;
         if (strcmp(n, "token_embd.weight") == 0) {
             ps->host_tok_emb = data;
@@ -1131,6 +1211,8 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     #undef PC
     return 1;
 bail:
+    for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
+    free(ps->f16_bufs); ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
     printf("[symbiont] GGUF parse failed. the field dissipates.\n");
     return 0;
@@ -1143,6 +1225,8 @@ static void symbiont_free(Symbiont *ps) {
             if (ps->field_layers[l].experts[e].alive)
                 free_lora_expert(&ps->field_layers[l].experts[e]);
     }
+    for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
+    free(ps->f16_bufs);
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
     memset(ps, 0, sizeof(Symbiont));
 }
