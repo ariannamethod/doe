@@ -9,7 +9,7 @@
 ```
 
 <h3 align="center">the 5th element. the symbiont. the sonar.</h3>
-<p align="center"><i>by <a href="https://github.com/ariannamethod">Arianna Method</a></i></p>
+<p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
 > *Host-agnostic inference symbiont. Wraps any GGUF with living LoRA experts, routes tokens through a parliament, modulates output through physics. No training loop. No backward pass. The organism learns by living.*
 
