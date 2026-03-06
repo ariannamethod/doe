@@ -1,0 +1,5 @@
+doe_field
+tests/test_doe
+doe_mycelium/
+*.o
+*.gguf
