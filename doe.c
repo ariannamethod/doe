@@ -1,5 +1,5 @@
 /*
- * doe.c — Democracy of Experts: Field Architecture
+ * doe.c — Democracy of Experts
  * the 5th element. the symbiont. the sonar.
  *
  * DOE finds a host model (any GGUF), wraps it with living LoRA
@@ -37,9 +37,9 @@
  *   moe.c  — the committee (Grok MoE)
  *   lee.c  — the self-aware one (Chuck VLM)
  *   m.c    — democracy of experts (DOE, trains)
- *   doe_field.c — the field (DOE.field, symbiont)
+ *   doe.c — the symbiont (DOE, inference)
  *
- * cc doe_field.c -O3 -lm -lpthread -o doe_field && ./doe_field
+ * cc doe.c -O3 -lm -lpthread -o doe && ./doe
  *
  * built by ariannamethod. the architecture is alive.
  * the host is mortal. the field is eternal.
@@ -107,8 +107,8 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CONFIGURATION
- * doe.field has no depth knob. the host provides depth.
- * doe.field has a field. the field provides everything else.
+ * doe has no depth knob. the host provides depth.
+ * doe has a field. the field provides everything else.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define MAX_EXPERTS       16
 #define MIN_EXPERTS       2
@@ -354,7 +354,7 @@ static void field_init(void) {
     F.expert_precise = 0.25f;
     calendar_init();
     field_mlp_init();
-    printf("[field] θ = ε + γ + αδ — field awakens. prophecy=%d destiny=%.2f\n",
+    printf("[doe] θ = ε + γ + αδ — symbiont awakens. prophecy=%d destiny=%.2f\n",
            F.prophecy, F.destiny);
 }
 
@@ -406,7 +406,7 @@ static void field_mlp_hebbian(const float *in, const float *out, float signal) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * FIELD STEP — the heartbeat. from AML am_step(), distilled for DOE.field.
+ * FIELD STEP — the heartbeat. from AML am_step(), distilled for DOE.
  * called per token. advances field physics by dt seconds.
  *
  * 1. calendar conflict → wormhole activation → dissonance bleed
@@ -686,7 +686,7 @@ static float expert_resonance(float expert_freq, HarmonicState *hs) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * WEIGHT PROFILER — DOE.field's sonar.
+ * WEIGHT PROFILER — DOE's sonar.
  * before attaching, DOE profiles the host's weights.
  * L2 norms per layer, spectral density, dead neuron ratio.
  * this tells DOE where to focus its LoRA experts.
@@ -1136,7 +1136,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++)
         if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) has_ffn = 1;
     if (!has_ffn) {
-        printf("[symbiont] host has no standard FFN. DOE.field needs a plain transformer.\n");
+        printf("[symbiont] host has no standard FFN. DOE needs a plain transformer.\n");
         goto bail;
     }
 
@@ -1202,7 +1202,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     printf("[symbiont] attached to %s (arch=%s dim=%d layers=%d heads=%d vocab=%d %.1fMB)\n",
            path, ps->host_arch, ps->host_dim, ps->host_n_layers, ps->host_heads,
            ps->host_vocab, (float)ps->mmap_size/(1024*1024));
-    printf("[symbiont] LoRA rank=%d alpha=%.2f experts=%d/layer — the field is alive.\n",
+    printf("[symbiont] LoRA rank=%d alpha=%.2f experts=%d/layer — the symbiont is alive.\n",
            ps->lora_rank, ps->lora_alpha, initial_experts);
     #undef PC
     return 1;
@@ -1210,7 +1210,7 @@ bail:
     for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
     free(ps->f16_bufs); ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
-    printf("[symbiont] GGUF parse failed. the field dissipates.\n");
+    printf("[symbiont] GGUF parse failed. the symbiont dissipates.\n");
     return 0;
 }
 
@@ -1418,7 +1418,7 @@ static void drift_snapshot(CalendarDrift *cd, float loss, Symbiont *ps, Harmonic
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * META-LEARNING — DOE.field learns from its own choices.
+ * META-LEARNING — DOE learns from its own choices.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     int step; int n_experts; float consensus, loss, field_health;
@@ -1466,7 +1466,7 @@ static void meta_record(MetaTrack *mt, int step, int n_exp, float consensus,
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * MYCELIUM — LoRA spore forest.
- * DOE.field doesn't save full model GGUFs. it saves LoRA configurations:
+ * DOE doesn't save full model GGUFs. it saves LoRA configurations:
  * the living experts, their weights, the parliament votes, the field state.
  * each spore is a snapshot of how DOE adapted to this host.
  * on restart with the same host (fingerprint match), load the best spore.
@@ -1492,7 +1492,7 @@ static void mycelium_init(MyceliumState *ms) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SYMBIONT FORWARD — run token through host with DOE.field modulation.
+ * SYMBIONT FORWARD — run token through host with DOE modulation.
  *
  * per layer:
  *   1. host attention (read-only weights, KV cache)
@@ -1681,8 +1681,8 @@ static void chat(Symbiont *ps) {
     HarmonicState hs = {0};
 
     char input[1024];
-    printf("\n[doe.field] the field is in session. type your message (Ctrl+C to dissipate):\n");
-    printf("[doe.field] host: %s (%s, %dM params)\n\n",
+    printf("\n[doe] the parliament is in session. type your message (Ctrl+C to dissipate):\n");
+    printf("[doe] host: %s (%s, %dM params)\n\n",
            ps->host_path, ps->host_arch,
            (int)(ps->host_vocab * ps->host_dim * 2 / 1000000)); /* rough estimate */
 
@@ -1796,7 +1796,7 @@ static void chat(Symbiont *ps) {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("\n  doe_field.c — Democracy of Experts: Field Architecture\n");
+    printf("\n  doe.c — Democracy of Experts\n");
     printf("  θ = ε + γ + αδ — the symbiont awakens.\n\n");
 
     char gguf_path[256] = "";
@@ -1806,14 +1806,14 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("doe_field.c — DOE.field: symbiont inference over any GGUF\n\n");
+            printf("doe.c — DOE: symbiont inference over any GGUF\n\n");
             printf("  --model PATH    path to host GGUF (or auto-detect)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
             printf("  --lora-rank N   LoRA rank (default: 16)\n");
             printf("  --lora-alpha F  LoRA injection strength (default: 0.1)\n\n");
-            printf("  BLAS: cc doe_field.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe_field\n");
-            printf("  GPU:  cc doe_field.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe_field\n");
+            printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
+            printf("  GPU:  cc doe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe\n");
             return 0;
         }
     }
@@ -1870,6 +1870,6 @@ int main(int argc, char **argv) {
 
     /* ── Cleanup ── */
     symbiont_free(&symbiont);
-    printf("[doe.field] the field dissipates. θ persists.\n");
+    printf("[doe] the parliament adjourns. θ persists.\n");
     return 0;
 }

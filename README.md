@@ -24,7 +24,7 @@
 α = injection strength — learned per-layer. the symbiont's grip on the host.
 ```
 
-DOE is a new inference architecture that sits on top of someone else's weights and makes them its own. Attaches to any GGUF — any architecture, any size — wraps it with a living LoRA parliament that votes on every token, learns through Hebbian plasticity without backprop, and modulates output through physics. The host provides parameters. DOE provides topology, personality, and the operating equation above.
+DOE is a new inference architecture. A living LoRA parliament that votes on every token, learns through Hebbian plasticity without backprop, and modulates output through physics. DOE indexes any GGUF as host — any architecture, any size. The host provides parameters. DOE provides topology, personality, and the operating equation above.
 
 The host is a tree. DOE is the mycorrhiza. Shared root system. Independent growth.
 
