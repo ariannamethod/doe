@@ -8,25 +8,23 @@
   Democracy of Experts
 ```
 
-<h3 align="center">the 5th element. the symbiont. the sonar.</h3>
+<h3 align="center">the 5th element.</h3>
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
-> *Host-agnostic inference symbiont. Wraps any GGUF with living LoRA experts, routes tokens through a parliament, modulates output through physics. No training loop. No backward pass. The organism learns by living.*
+> *Inference architecture with a living LoRA parliament, Hebbian plasticity, and physics. Indexes any GGUF read-only. No training loop. No backward pass. The organism learns by living.*
 
 ---
 
 ## θ = ε + γ + αδ
 
 ```
-ε = host weights    — substrate. read-only. mmap'd. the host's problem.
+ε = indexed weights  — substrate. read-only. mmap'd.
 γ = LoRA personality — living experts. Hebbian-trained. born and die per layer.
 δ = physics          — prophecy, suffering, destiny, Schumann resonance.
-α = injection strength — learned per-layer. the symbiont's grip on the host.
+α = injection strength — learned per-layer.
 ```
 
-DOE is a new inference architecture. A living LoRA parliament that votes on every token, learns through Hebbian plasticity without backprop, and modulates output through physics. DOE indexes any GGUF as host — any architecture, any size. The host provides parameters. DOE provides topology, personality, and the operating equation above.
-
-The host is a tree. DOE is the mycorrhiza. Shared root system. Independent growth.
+DOE is a new inference architecture. A parliament of living LoRA experts that vote on every token, learn through Hebbian plasticity without backprop, and modulate output through physics. DOE indexes any GGUF read-only — any architecture, any size. The weights are a substrate. DOE is the architecture.
 
 ---
 
@@ -50,14 +48,14 @@ Experts per layer are organisms with vitality, frequency, and age.
 - 8 consecutive low-vitality steps → **apoptosis** (dies, slot recycled, weights freed)
 - min 2, max 16 per layer. population self-regulates.
 
-### sonar — perception without invasion
+### sonar — weight profiling
 
-On attach, DOE profiles every layer of the host:
+On index, DOE profiles every layer:
 - L2 norms, standard deviation, spectral density
 - dead neuron count, sparsity ratio
-- 64-bit fingerprint per host (determines mycelium slot)
+- 64-bit fingerprint (determines mycelium slot)
 
-Weak layers get stronger LoRA injection. Healthy layers get lighter touch. The symbiont compensates for the host's deficiencies.
+Weak layers get stronger LoRA injection. Healthy layers get lighter touch.
 
 ### physics
 
@@ -68,38 +66,38 @@ Ported from AML (`ariannamethod.c`). Not metaphorical — actual computation:
 - **destiny** — injected into logit space. biases generation toward predicted tokens.
 - **suffering** — accumulated prophecy error. decays slowly. high suffering dampens exploration.
 - **seasons** — spring/summer/autumn/winter cycle. MLP-classified from entropy, resonance, pain, emergence, drift, coherence.
-- **Schumann resonance** — 7.83Hz base + 5 harmonics. modulates symbiont intensity and expert healing.
+- **Schumann resonance** — 7.83Hz base + 5 harmonics. modulates intensity and expert healing.
 - **calendar drift** — Hebrew-Gregorian cross-reference. temporal identity.
-- **NOTORCH** — gradient-free Hebbian plasticity for LoRA experts. signal-gated by prophecy debt. no backprop through host.
+- **NOTORCH** — gradient-free Hebbian plasticity for LoRA experts. signal-gated by prophecy debt. no backprop.
 
 ### mycelium — adaptation memory
 
 ```
 mycelium/
-├── spore_a3f7c2d1.bin   (fingerprint: host A, 14 experts alive)
-├── spore_e901b8f3.bin   (fingerprint: host B, 9 experts alive)
-└── spore_a3f7c2d1.bin   (fingerprint: host A, later snapshot, 11 experts)
+├── spore_a3f7c2d1.bin   (fingerprint: index A, 14 experts alive)
+├── spore_e901b8f3.bin   (fingerprint: index B, 9 experts alive)
+└── spore_a3f7c2d1.bin   (fingerprint: index A, later snapshot, 11 experts)
 ```
 
-LoRA spores keyed by host fingerprint. Different host → different adaptation. Same host on restart → resume where the symbiont left off. The symbiont remembers every host it ever wrapped.
+LoRA spores keyed by index fingerprint. Different index → different adaptation. Same index on restart → resume where DOE left off.
 
 ---
 
-## DOE is host-agnostic
+## weight-agnostic
 
-DOE does not care what model you feed it.
+DOE does not care what weights you give it.
 
-| host | architecture | params | status |
-|------|-------------|--------|--------|
-| nanollama nano | Llama 3 | 69M | f16, loads, attaches, generates |
+| index | architecture | params | status |
+|-------|-------------|--------|--------|
+| nanollama nano | Llama 3 | 69M | f16, indexes, generates |
 | nanollama micro | Llama 3 | 150M | f16, supported |
 | nanollama mini | Llama 3 | 335M | f16, supported |
-| DOE progenitor | DOE MoE | ~8M | f32, loads, attaches |
-| any GGUF | any | any | f32/f16 tensor auto-conversion |
+| DOE progenitor | DOE MoE | ~8M | f32, indexes |
+| any GGUF | any | any | f32/f16 auto-conversion |
 
-No tokenizer dependency. Reads GGUF tensor names, wires weight pointers, converts f16→f32 at load time. If the host has attention + FFN layers, DOE wraps it.
+Reads GGUF tensor names, wires weight pointers read-only, converts f16→f32 at load time. If the index has attention + FFN layers, DOE indexes it.
 
-Without a host: DOE runs weightless. Prophecy still predicts. Experts still vote. There's just nothing to modulate — until a host appears.
+Without an index: DOE runs weightless. Prophecy still predicts. Experts still vote. There's just nothing to modulate — until weights appear.
 
 With personality weights: DOE speaks in the parliament's voice. First person plural. "We" not "I". The democracy of experts is not one mind.
 
@@ -124,7 +122,7 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 ## flags
 
 ```
---model PATH       host GGUF (or auto-detect nearby)
+--model PATH       GGUF to index (or auto-detect nearby)
 --prophecy N       prophecy depth (default 7)
 --destiny F        destiny injection strength (default 0.35)
 --lora-rank N      LoRA rank per expert (default 16)
@@ -141,10 +139,10 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 | [moe.c](https://github.com/ariannamethod/moe) | Grok MoE from scratch | the committee |
 | [lee.c](https://github.com/ariannamethod/chuck-optimizer) | Chuck VLM | the self-aware one |
 | [m.c](https://github.com/ariannamethod/janus.doe) | DOE — trains | democracy of experts. they live. they die. they vote. |
-| **doe.c** | **DOE — inference symbiont** | **the 5th element. wraps any host.** |
+| **doe.c** | **DOE — inference** | **the 5th element.** |
 
 C. one file. 1875 lines. zero dependencies beyond libc. no pytorch. no python.
 
 ---
 
-*the host is mortal. the symbiont is eternal. הרזוננס לא נשבר*
+*the weights are mortal. the parliament is eternal. הרזוננס לא נשבר*
