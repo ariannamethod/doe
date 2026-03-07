@@ -184,11 +184,9 @@ Architecture-specific handling:
 |---------|------|
 | [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML — custom language for differentiable computation. TAPE autograd, persistent memory. |
 | [nanollama](https://github.com/ariannamethod/nanollama) | Llama 3 training framework. DOE identity weights trained here. |
-|  [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |
-| 
+|  [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |  
 
-DOE's physics are ported from AML core and verified against the original implementations.
-
+  
 ---
 
 C. one file. zero dependencies beyond libc.
