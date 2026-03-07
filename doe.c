@@ -2097,19 +2097,60 @@ static int sample(float *logits, int V, float temp, int top_k) {
     return V - 1;
 }
 
+/* GPT-2 byte_decoder: reverse the byte_encoder mapping (unicode codepoint -> original byte) */
+static int gpt2_rune_to_byte(int rune) {
+    static int table_built = 0;
+    static int rtable[512]; /* rune -> byte, -1 if not mapped */
+    if (!table_built) {
+        for (int i = 0; i < 512; i++) rtable[i] = -1;
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))
+                rtable[b] = b; /* identity mapping */
+            else
+                rtable[256 + n++] = b; /* offset mapping */
+        }
+        table_built = 1;
+    }
+    if (rune >= 0 && rune < 512) return rtable[rune];
+    return -1;
+}
+
+/* Parse one UTF-8 codepoint, return codepoint and advance *p by bytes consumed */
+static int utf8_decode_cp(const char **p) {
+    const unsigned char *s = (const unsigned char *)*p;
+    int cp, len;
+    if (s[0] < 0x80) { cp = s[0]; len = 1; }
+    else if ((s[0] & 0xE0) == 0xC0) { cp = (s[0] & 0x1F) << 6 | (s[1] & 0x3F); len = 2; }
+    else if ((s[0] & 0xF0) == 0xE0) { cp = (s[0] & 0x0F) << 12 | (s[1] & 0x3F) << 6 | (s[2] & 0x3F); len = 3; }
+    else if ((s[0] & 0xF8) == 0xF0) { cp = (s[0] & 0x07) << 18 | (s[1] & 0x3F) << 12 | (s[2] & 0x3F) << 6 | (s[3] & 0x3F); len = 4; }
+    else { cp = s[0]; len = 1; } /* fallback */
+    *p += len;
+    return cp;
+}
+
 /* Decode token to text using GGUF vocab, fallback to byte */
 static void token_decode_print(GGUFIndex *ps, int token) {
     if (ps->vocab_tokens && token >= 0 && token < ps->vocab_size && ps->vocab_tokens[token]) {
         const char *s = ps->vocab_tokens[token];
         if (ps->is_gpt2_bpe) {
-            /* GPT-2 byte-level BPE: Ġ (0xC4 0xA0) = space, Ċ (0xC4 0x8A) = newline */
-            while (*s) {
-                if ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0xA0) {
-                    fputc(' ', stdout); s += 2;
-                } else if ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0x8A) {
-                    fputc('\n', stdout); s += 2;
-                } else { fputc(*s, stdout); s++; }
+            /* GPT-2 byte-level BPE: full byte_decoder — each codepoint maps to one byte */
+            unsigned char buf[256];
+            int blen = 0;
+            const char *p = s;
+            while (*p && blen < (int)sizeof(buf) - 4) {
+                int cp = utf8_decode_cp(&p);
+                int b = gpt2_rune_to_byte(cp);
+                if (b >= 0) buf[blen++] = (unsigned char)b;
+                else {
+                    /* Not a GPT-2 mapped byte — emit codepoint as UTF-8 */
+                    if (cp < 0x80) { buf[blen++] = cp; }
+                    else if (cp < 0x800) { buf[blen++] = 0xC0|(cp>>6); buf[blen++] = 0x80|(cp&0x3F); }
+                    else if (cp < 0x10000) { buf[blen++] = 0xE0|(cp>>12); buf[blen++] = 0x80|((cp>>6)&0x3F); buf[blen++] = 0x80|(cp&0x3F); }
+                    else { buf[blen++] = 0xF0|(cp>>18); buf[blen++] = 0x80|((cp>>12)&0x3F); buf[blen++] = 0x80|((cp>>6)&0x3F); buf[blen++] = 0x80|(cp&0x3F); }
+                }
             }
+            fwrite(buf, 1, blen, stdout);
         } else {
         /* Handle sentencepiece ▁ (U+2581, 3 bytes: E2 96 81) → space */
         while (*s) {
