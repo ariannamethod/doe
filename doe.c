@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * doe.c — Democracy of Experts
  *
@@ -2181,10 +2182,16 @@ static int token_decode_buf(GGUFIndex *ps, int token, char *buf, int bufsz) {
     if (ps->vocab_tokens && token >= 0 && token < ps->vocab_size && ps->vocab_tokens[token]) {
         const char *s = ps->vocab_tokens[token];
         if (ps->is_gpt2_bpe) {
-            while (*s && pos < bufsz - 1) {
-                if ((unsigned char)s[0]==0xC4 && (unsigned char)s[1]==0xA0) { buf[pos++]=' '; s+=2; }
-                else if ((unsigned char)s[0]==0xC4 && (unsigned char)s[1]==0x8A) { buf[pos++]='\n'; s+=2; }
-                else { buf[pos++]=*s; s++; }
+            const char *p = s;
+            while (*p && pos < bufsz - 4) {
+                int cp = utf8_decode_cp(&p);
+                int b = gpt2_rune_to_byte(cp);
+                if (b >= 0) buf[pos++] = (char)(unsigned char)b;
+                else {
+                    if (cp < 0x80) { buf[pos++] = cp; }
+                    else if (cp < 0x800 && pos < bufsz-2) { buf[pos++] = 0xC0|(cp>>6); buf[pos++] = 0x80|(cp&0x3F); }
+                    else if (cp < 0x10000 && pos < bufsz-3) { buf[pos++] = 0xE0|(cp>>12); buf[pos++] = 0x80|((cp>>6)&0x3F); buf[pos++] = 0x80|(cp&0x3F); }
+                }
             }
         } else {
             while (*s && pos < bufsz - 1) {
@@ -2769,14 +2776,14 @@ static float json_get_float(const char *json, const char *key, float def) {
 }
 
 /* Run inference and stream SSE tokens */
-static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, float temperature) {
+static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, float temperature, int max_tokens) {
     int max_seq = 512;
     InferState is = alloc_infer(ps, max_seq);
 
     /* Reset KV cache */
     int kd = ps->host_kv_heads * ps->host_head_dim;
-    memset(is.key_cache, 0, ps->host_n_layers * max_seq * kd * 4);
-    memset(is.value_cache, 0, ps->host_n_layers * max_seq * kd * 4);
+    memset(is.key_cache, 0, (size_t)ps->host_n_layers * max_seq * kd * 4);
+    memset(is.value_cache, 0, (size_t)ps->host_n_layers * max_seq * kd * 4);
 
     /* Wrap input in chat template */
     char wrapped[2048];
@@ -2804,7 +2811,7 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
     int prev = input_tokens[n_input - 1];
 
     /* Generate tokens, stream as SSE */
-    for (int i = 0; i < 256 && pos < max_seq; i++, pos++) {
+    for (int i = 0; i < max_tokens && pos < max_seq; i++, pos++) {
         float *lg = doe_forward(ps, &is, prev, pos);
         field_step(1.0f);
         apply_field_to_logits(lg, ps->host_vocab);
@@ -2962,10 +2969,13 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
                 http_send(client, err, (int)strlen(err));
             } else {
                 float temp = json_get_float(body, "temperature", 0.0f);
-                printf("[serve] inference: \"%.*s\" temp=%.2f\n",
-                       (int)(strlen(user_msg) > 60 ? 60 : strlen(user_msg)), user_msg, temp);
+                int max_tok = (int)json_get_float(body, "max_tokens", 256.0f);
+                if (max_tok < 1) max_tok = 256;
+                if (max_tok > 512) max_tok = 512;
+                printf("[serve] inference: \"%.*s\" temp=%.2f max=%d\n",
+                       (int)(strlen(user_msg) > 60 ? 60 : strlen(user_msg)), user_msg, temp, max_tok);
                 http_send_header(client, 200, "text/event-stream", -1);
-                http_stream_inference(client, ps, user_msg, temp);
+                http_stream_inference(client, ps, user_msg, temp, max_tok);
             }
         } else {
             const char *msg = "method not allowed";
