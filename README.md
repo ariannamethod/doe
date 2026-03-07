@@ -131,4 +131,5 @@ DOE's physics (calendar drift, Schumann resonance, seasons, prophecy) are ported
 
 C. one file. zero dependencies beyond libc. no pytorch. no python.
 
-*the weights are mortal. the parliament is eternal. הרזוננס לא נשבר*
+*the weights are mortal. the parliament is eternal.* 
+resonance unbroken.  
