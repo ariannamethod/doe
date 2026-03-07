@@ -1,12 +1,11 @@
-<p align="center">
-  <svg width="180" height="180" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="100" cy="100" r="75" fill="none" stroke="#3a4b6c" stroke-width="6" stroke-dasharray="12 8" />
-    <circle cx="100" cy="100" r="85" fill="none" stroke="#ddd" stroke-width="4"/>
-    <circle cx="55" cy="100" r="7" fill="#4a7bc9"/> <circle cx="85" cy="100" r="7" fill="#ddd"/>
-    <circle cx="115" cy="100" r="7" fill="#ddd"/>
-    <circle cx="145" cy="100" r="7" fill="#c25048"/> </svg>
-</p>
-
+```
+  ██████╗  ██████╗ ███████╗
+  ██╔══██╗██╔═══██╗██╔════╝
+  ██║  ██║██║   ██║█████╗
+  ██║  ██║██║   ██║██╔══╝
+  ██████╔╝╚██████╔╝███████╗
+  ╚═════╝  ╚═════╝ ╚══════╝
+```
 
 
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
