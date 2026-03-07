@@ -1042,6 +1042,95 @@ static void test_spore_path_format(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * GPT-2 byte decoder tests
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_gpt2_rune_to_byte_ascii(void) {
+    TEST(gpt2_rune_to_byte_ascii);
+    /* Printable ASCII maps to itself */
+    ASSERT_TRUE(gpt2_rune_to_byte('A') == 'A', "A -> A");
+    ASSERT_TRUE(gpt2_rune_to_byte('z') == 'z', "z -> z");
+    ASSERT_TRUE(gpt2_rune_to_byte('0') == '0', "0 -> 0");
+    ASSERT_TRUE(gpt2_rune_to_byte('!') == '!', "! -> !");
+    ASSERT_TRUE(gpt2_rune_to_byte('~') == '~', "~ -> ~");
+    PASS();
+}
+
+static void test_gpt2_rune_to_byte_space(void) {
+    TEST(gpt2_rune_to_byte_space);
+    /* Space (0x20) is NOT in identity range (33-126), gets offset mapping */
+    /* gpt2_byte_to_rune(0x20) should give us the rune for space */
+    int space_rune = gpt2_byte_to_rune(0x20);
+    ASSERT_TRUE(space_rune >= 256, "space maps to 256+");
+    /* Reverse: that rune should map back to 0x20 */
+    ASSERT_TRUE(gpt2_rune_to_byte(space_rune) == 0x20, "reverse maps back to space");
+    PASS();
+}
+
+static void test_gpt2_rune_to_byte_roundtrip(void) {
+    TEST(gpt2_rune_to_byte_roundtrip);
+    /* Every byte 0-255 should roundtrip through encode->decode */
+    int ok = 1;
+    for (int b = 0; b < 256; b++) {
+        int rune = gpt2_byte_to_rune(b);
+        int back = gpt2_rune_to_byte(rune);
+        if (back != b) { ok = 0; break; }
+    }
+    ASSERT_TRUE(ok, "all 256 bytes roundtrip");
+    PASS();
+}
+
+static void test_gpt2_rune_to_byte_emdash(void) {
+    TEST(gpt2_rune_to_byte_emdash);
+    /* Em-dash U+2014 = UTF-8 bytes E2 80 94 */
+    /* In GPT-2: byte 0xE2 -> identity (226), byte 0x80 -> 256+offset, byte 0x94 -> 256+offset */
+    int r0 = gpt2_byte_to_rune(0xE2);
+    int r1 = gpt2_byte_to_rune(0x80);
+    int r2 = gpt2_byte_to_rune(0x94);
+    ASSERT_TRUE(gpt2_rune_to_byte(r0) == 0xE2, "E2 roundtrips");
+    ASSERT_TRUE(gpt2_rune_to_byte(r1) == 0x80, "80 roundtrips");
+    ASSERT_TRUE(gpt2_rune_to_byte(r2) == 0x94, "94 roundtrips");
+    PASS();
+}
+
+static void test_gpt2_rune_to_byte_invalid(void) {
+    TEST(gpt2_rune_to_byte_invalid);
+    ASSERT_TRUE(gpt2_rune_to_byte(999) == -1, "out of range returns -1");
+    ASSERT_TRUE(gpt2_rune_to_byte(-1) == -1, "negative returns -1");
+    PASS();
+}
+
+static void test_utf8_decode_cp_ascii(void) {
+    TEST(utf8_decode_cp_ascii);
+    const char *s = "ABC";
+    int cp = utf8_decode_cp(&s);
+    ASSERT_TRUE(cp == 'A', "first char is A");
+    ASSERT_TRUE(s[0] == 'B', "pointer advanced by 1");
+    PASS();
+}
+
+static void test_utf8_decode_cp_twobyte(void) {
+    TEST(utf8_decode_cp_twobyte);
+    /* U+00E9 (e-acute) = C3 A9 */
+    const char s[] = "\xC3\xA9X";
+    const char *p = s;
+    int cp = utf8_decode_cp(&p);
+    ASSERT_TRUE(cp == 0xE9, "decoded e-acute");
+    ASSERT_TRUE(*p == 'X', "pointer advanced by 2");
+    PASS();
+}
+
+static void test_utf8_decode_cp_threebyte(void) {
+    TEST(utf8_decode_cp_threebyte);
+    /* U+2014 (em-dash) = E2 80 94 */
+    const char s[] = "\xE2\x80\x94Y";
+    const char *p = s;
+    int cp = utf8_decode_cp(&p);
+    ASSERT_TRUE(cp == 0x2014, "decoded em-dash");
+    ASSERT_TRUE(*p == 'Y', "pointer advanced by 3");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * MAIN — run all tests
  * ═══════════════════════════════════════════════════════════════════ */
 int main(void) {
@@ -1176,6 +1265,17 @@ int main(void) {
     /* Mycelium */
     printf("\n[mycelium]\n");
     test_spore_path_format();
+
+    /* GPT-2 byte decoder */
+    printf("\n[gpt2_byte]\n");
+    test_gpt2_rune_to_byte_ascii();
+    test_gpt2_rune_to_byte_space();
+    test_gpt2_rune_to_byte_roundtrip();
+    test_gpt2_rune_to_byte_emdash();
+    test_gpt2_rune_to_byte_invalid();
+    test_utf8_decode_cp_ascii();
+    test_utf8_decode_cp_twobyte();
+    test_utf8_decode_cp_threebyte();
 
     /* Summary */
     printf("\n═══════════════════════════════════════════════════════\n");
