@@ -5,7 +5,6 @@
   ██║  ██║██║   ██║██╔══╝
   ██████╔╝╚██████╔╝███████╗
   ╚═════╝  ╚═════╝ ╚══════╝
-  Democracy of Experts
 ```
 
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
