@@ -69,7 +69,7 @@ On index, DOE profiles every layer: L2 norms, standard deviation, spectral densi
 
 ## physics
 
-Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core. Calendar drift verified against [pitomadom](https://github.com/ariannamethod/pitomadom). Schumann resonance from [arianna.c](https://github.com/ariannamethod/arianna.c).
+Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core. Calendar drift verified against 
 
 - **prophecy** — N-step forward prediction. prophesied distribution vs manifested.
 - **prophecy debt** — min(destined - manifested). gates Hebbian learning.
@@ -184,9 +184,8 @@ Architecture-specific handling:
 |---------|------|
 | [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML — custom language for differentiable computation. TAPE autograd, persistent memory. |
 | [nanollama](https://github.com/ariannamethod/nanollama) | Llama 3 training framework. DOE identity weights trained here. |
-| [arianna.c](https://github.com/ariannamethod/arianna.c) | 550M organism. Soul 36M BPE. C/Go. Schumann resonance origin. |
-| [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |
-| [dubrovsky](https://github.com/ariannamethod/dubrovsky) | 9.5M Llama 3 absurdist. char-level. proof that small models speak. |
+|  [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |
+| 
 
 DOE's physics are ported from AML core and verified against the original implementations.
 
