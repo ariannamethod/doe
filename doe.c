@@ -978,6 +978,7 @@ typedef struct {
         float *wq, *wk, *wv, *wo;
         float *bq, *bk, *bv;   /* attention biases (Qwen2, optional) */
         float *ffn_gate, *ffn_up, *ffn_down;
+        float *ffn_gate_up;  /* fused gate+up for Phi-3 (size: hidden*2 × dim) */
         float *attn_norm, *ffn_norm;
     } host_layers[MAX_LAYERS];
 
@@ -1333,6 +1334,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
             ps->f16_bufs[ps->n_f16_bufs++] = data;
         }
         char *n = tinfo[i].name;
+        /* debug: if (i < 15) printf("[tensor] %s dims=[%lu,%lu]\n", n, (unsigned long)tinfo[i].dims[0], (unsigned long)tinfo[i].dims[1]); */
         if (strcmp(n, "token_embd.weight") == 0) {
             ps->host_tok_emb = data;
             if (ps->host_vocab == 0) ps->host_vocab = (int)tinfo[i].dims[1];
@@ -1350,11 +1352,21 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 else if (strstr(n, "attn_q.bias")) { ps->host_layers[l].bq = data; wired++; }
                 else if (strstr(n, "attn_k.bias")) { ps->host_layers[l].bk = data; wired++; }
                 else if (strstr(n, "attn_v.bias")) { ps->host_layers[l].bv = data; wired++; }
-                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp")) { ps->host_layers[l].ffn_gate = data; wired++; }
-                else if (strstr(n, "ffn_up.weight")) { ps->host_layers[l].ffn_up = data; wired++; }
+                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp") && !strstr(n, "ffn_gate_up")) { ps->host_layers[l].ffn_gate = data; wired++; }
+                else if (strstr(n, "ffn_up.weight") && !strstr(n, "gate_up")) {
+                    /* Check if fused gate+up: dims[1] > host_hidden means [dim, hidden*2] */
+                    if (ps->host_hidden > 0 && (int)tinfo[i].dims[1] > ps->host_hidden * 3 / 2) {
+                        ps->host_layers[l].ffn_gate_up = data;
+                    } else {
+                        ps->host_layers[l].ffn_up = data;
+                    }
+                    wired++;
+                }
                 else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; wired++; }
+                else if (strstr(n, "ffn_gate_up_proj") || strstr(n, "ffn_gate_up.weight")) { ps->host_layers[l].ffn_gate_up = data; wired++; }
                 else if (strstr(n, "attn_norm.weight")) { ps->host_layers[l].attn_norm = data; wired++; }
                 else if (strstr(n, "ffn_norm.weight")) { ps->host_layers[l].ffn_norm = data; wired++; }
+                else if (l == 0 && strstr(n, "ffn")) { printf("[doe] unwired FFN tensor: %s\n", n); }
             }
         }
     }
@@ -1373,8 +1385,10 @@ static int index_load(GGUFIndex *ps, const char *path) {
 
     /* Check for standard FFN (skip MoE hosts for now) */
     int has_ffn = 0;
-    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++)
+    for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
         if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) has_ffn = 1;
+        if (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) has_ffn = 1;
+    }
     if (!has_ffn) {
         printf("[doe] host has no standard FFN. DOE needs a plain transformer.\n");
         goto bail;
@@ -1907,7 +1921,7 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     s.k = calloc(kd, 4); s.v = calloc(kd, 4);
     s.att = calloc(ps->host_heads * max_seq, 4);
     s.logits = calloc(ps->host_vocab, 4);
-    s.hb = calloc(H, 4); s.hb2 = calloc(H, 4);
+    s.hb = calloc(H, 4); s.hb2 = calloc(H * 2, 4); /* *2 for fused gate_up */
     s.expert_out = calloc(D, 4);
     s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
     s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
@@ -2017,15 +2031,25 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         }
 
         /* ── Host FFN (SwiGLU) ── */
-        if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
+        {
             float *fn = s->xb;
             if (ps->host_layers[l].ffn_norm) rmsnorm(fn, s->x, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
             else memcpy(fn, s->x, D*4);
-            matvec(s->hb, ps->host_layers[l].ffn_gate, fn, H, D);
-            matvec(s->hb2, ps->host_layers[l].ffn_up, fn, H, D);
-            for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
-            matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
-            for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
+
+            if (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) {
+                /* Fused gate_up: [hidden*2, dim] → split into gate [0..H) and up [H..2H) */
+                matvec(s->hb2, ps->host_layers[l].ffn_gate_up, fn, H * 2, D);
+                for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb2[i]) * s->hb2[H + i];
+                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
+            } else if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
+                /* Standard separate gate + up */
+                matvec(s->hb, ps->host_layers[l].ffn_gate, fn, H, D);
+                matvec(s->hb2, ps->host_layers[l].ffn_up, fn, H, D);
+                for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
+                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
+            }
         }
     }
 
