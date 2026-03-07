@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DOE: Symbiont Terminal</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=EB+Garamond:ital,wght@0,400;1,400&display=swap');
+  
+  :root {
+    --paper: #020203; --ink: #ddd; --ink-light: #6b6960;
+    --ink-faint: #3a4b6c; --accent: #c0392b; --accent-cool: #4a7bc9;
+    --mono: 'Space Mono', monospace; --serif: 'EB Garamond', serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--paper); color: var(--ink); font-family: var(--mono); overflow: hidden; }
+  
+  #canvas-container { 
+    position: absolute; inset: 0; perspective: 1000px; z-index: 1; 
+    transform-style: preserve-3d;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* Nanollama Topbar HUD */
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0; height: 50px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 30px; border-bottom: 1px solid rgba(255,255,255,0.05);
+    z-index: 10; background: rgba(2,2,3,0.8); backdrop-filter: blur(4px);
+  }
+  .hud-group { display: flex; gap: 30px; font-size: 11px; color: var(--ink-light); letter-spacing: 0.05em; }
+  .hud-group span { color: var(--ink); font-weight: bold; }
+  .hud-brand { font-size: 11px; letter-spacing: 6px; color: var(--accent-cool); font-weight: bold; text-transform: uppercase; }
+
+  /* Equation Watermark */
+  #equation { position: absolute; top: 70px; left: 30px; font-size: 11px; color: var(--ink-faint); z-index: 10; pointer-events: none; }
+  #equation .highlight { color: var(--accent-cool); font-weight: bold; }
+  #equation .host-color { color: var(--accent); }
+
+  /* Token Stream Output */
+  #stream-output {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 600px; text-align: center; font-family: var(--serif); font-size: 24px;
+    color: #fff; text-shadow: 0 0 20px rgba(74,123,201,0.8); z-index: 15; pointer-events: none;
+    opacity: 0; transition: opacity 0.5s; line-height: 1.4;
+  }
+
+  /* Input Bar */
+  #input-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 70px;
+    border-top: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center;
+    padding: 0 30px; background: rgba(5, 10, 20, 0.8); backdrop-filter: blur(10px); z-index: 20;
+  }
+  #input-bar .prompt-sym { font-size: 14px; color: var(--accent-cool); margin-right: 16px; font-weight: bold; }
+  #input-bar input {
+    background: none; border: none; outline: none; color: #fff;
+    font-family: var(--mono); font-size: 14px; flex: 1; letter-spacing: 0.02em;
+  }
+  #input-bar input::placeholder { color: var(--ink-faint); font-style: italic; }
+  
+  /* Nanollama Entropy Ribbon */
+  #entropy-ribbon {
+    position: fixed; bottom: 70px; left: 0; right: 0; height: 30px;
+    z-index: 10; pointer-events: none; opacity: 0.7;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1"></script>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="hud-brand">DOE // SYMBIONT</div>
+  <div class="hud-group">
+    <div>TOK/S: <span id="hud-tok">0.0</span></div>
+    <div>EXPERTS: <span id="hud-exp">8</span>/16</div>
+    <div>DEBT: <span id="hud-debt">0.00</span></div>
+    <div>CONSENSUS: <span id="hud-cons">0.00</span></div>
+  </div>
+</div>
+
+<div id="equation">
+  θ = <span class="host-color">ε</span> + <span class="highlight">γ</span> + αδ
+</div>
+
+<div id="canvas-container">
+  <canvas id="c"></canvas>
+</div>
+
+<div id="stream-output"></div>
+<canvas id="entropy-ribbon"></canvas>
+
+<div id="input-bar">
+  <span class="prompt-sym">&rarr;</span>
+  <input type="text" id="prompt" placeholder="inject thought into the parliament..." autocomplete="off">
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const ribbon = document.getElementById('entropy-ribbon');
+const rCtx = ribbon.getContext('2d');
+const maskCanvas = document.createElement('canvas');
+const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+const streamDiv = document.getElementById('stream-output');
+const container = document.getElementById('canvas-container');
+
+let w, h, rw;
+let particles = [];
+let blasts = [];
+let entropyHistory = [];
+
+const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*+=-/\\";
+const wordsFlow = "democracy experts mitosis apoptosis schumann prophecy_debt notorch ".split("");
+
+// DOE State
+const state = {
+    prophecyDebt: 0.0,   // 0 = Хаос, 1 = Лицо (Монолит)
+    consensus: 0.95,     // Раскол лица
+    assimilation: 1.0,   // Цвет (Host/Core)
+    velocity: 1.5,       // Шум
+    schumannHz: 7.83,
+    triggerBlast: () => blasts.push({ x: w/2, y: h/2, radius: 0, power: 120, life: 1.0 })
+};
+
+const gui = new lil.GUI({ title: 'FIELD TELEMETRY' });
+gui.add(state, 'prophecyDebt', 0.0, 1.0).name('Prophecy Debt').listen();
+gui.add(state, 'consensus', 0.0, 1.0).name('Consensus').listen();
+gui.add(state, 'assimilation', 0.0, 1.0).name('Assimilation (α)').listen();
+gui.add(state, 'velocity', 0.1, 4.0).name('Velocity').listen();
+gui.add(state, 'triggerBlast').name('Force Burst');
+
+// Управление мышью
+let mx = -1000, my = -1000;
+let targetMx = window.innerWidth/2, targetMy = window.innerHeight/2;
+let smoothMx = targetMx, smoothMy = targetMy;
+
+window.addEventListener('mousemove', e => { 
+    mx = e.clientX; my = e.clientY; 
+    targetMx = mx; targetMy = my;
+});
+window.addEventListener('mouseout', () => { 
+    mx = -1000; my = -1000; 
+    targetMx = w/2; targetMy = h/2; 
+});
+window.addEventListener('mousedown', e => {
+    blasts.push({ x: e.clientX, y: e.clientY, radius: 0, power: 100, life: 1.0 });
+});
+
+class Particle {
+    constructor(bx, by, brightness) {
+        this.x = Math.random() * w;
+        this.y = Math.random() * h;
+        this.vx = (Math.random() - 0.5) * 5;
+        this.vy = (Math.random() - 0.5) * 5;
+        
+        this.baseX = bx;
+        this.baseY = by;
+        this.isLeft = bx < w/2;
+        this.brightness = brightness;
+        
+        // Галактические параметры
+        this.orbitRadius = Math.hypot(bx - w/2, by - h/2) * (0.5 + Math.random()*2.5);
+        this.orbitAngle = Math.atan2(by - h/2, bx - w/2);
+        this.orbitSpeed = (Math.random() - 0.5) * 0.015;
+        
+        // Уникальная фаза для "дыхания" в состоянии покоя
+        this.breathePhaseX = Math.random() * Math.PI * 2;
+        this.breathePhaseY = Math.random() * Math.PI * 2;
+        
+        this.char = charset[Math.floor(Math.random() * charset.length)];
+        this.wordChar = wordsFlow[Math.floor(Math.random() * wordsFlow.length)];
+        this.mass = 0.3 + Math.random() * 1.5; 
+    }
+
+    update(time) {
+        // НИКАКОЙ СТАТИКИ: Базовые якоря "дышат" как водоросли
+        let currentBaseX = this.baseX + Math.sin(time * 0.5 + this.breathePhaseX) * 15;
+        let currentBaseY = this.baseY + Math.cos(time * 0.5 + this.breathePhaseY) * 15;
+
+        // Раскол Януса
+        const splitDist = (1.0 - state.consensus) * 150;
+        let tx = currentBaseX + (this.isLeft ? -splitDist : splitDist);
+        let ty = currentBaseY;
+
+        // РЕЖИМ ГАЛАКТИКИ (Плавный переход от лица к туманности)
+        let chaosWeight = Math.max(0, 1.0 - state.prophecyDebt * 2.5); 
+        if (chaosWeight > 0) {
+            this.orbitAngle += this.orbitSpeed * state.velocity;
+            let cx = w/2 + Math.cos(this.orbitAngle) * this.orbitRadius;
+            let cy = h/2 + Math.sin(this.orbitAngle) * this.orbitRadius;
+            tx = tx * (1 - chaosWeight) + cx * chaosWeight;
+            ty = ty * (1 - chaosWeight) + cy * chaosWeight;
+        }
+
+        // Гравитация Долга (Пружина)
+        const spring = 0.01 + Math.pow(state.prophecyDebt, 2) * 0.12;
+        this.vx += (tx - this.x) * spring;
+        this.vy += (ty - this.y) * spring;
+
+        // Броуновский шум
+        this.vx += (Math.random() - 0.5) * state.velocity * (1 + chaosWeight);
+        this.vy += (Math.random() - 0.5) * state.velocity * (1 + chaosWeight);
+
+        // ИСПРАВЛЕННОЕ МАГНИТНОЕ ПОЛЕ МЫШИ
+        let dx = this.x - smoothMx;
+        let dy = this.y - smoothMy;
+        let dist = Math.max(Math.hypot(dx, dy), 1.0); // Защита от деления на ноль
+        let repelRadius = 120 + state.velocity * 15; 
+        
+        if (dist < repelRadius && mx !== -1000) {
+            let force = Math.pow((repelRadius - dist) / repelRadius, 2);
+            // Аккуратная сила отталкивания
+            this.vx += (dx / dist) * force * 1.5 / this.mass;
+            this.vy += (dy / dist) * force * 1.5 / this.mass;
+        }
+
+        // ИСПРАВЛЕННЫЕ ВЗРЫВНЫЕ ВОЛНЫ
+        for (let b of blasts) {
+            let bdx = this.x - b.x, bdy = this.y - b.y;
+            let bDist = Math.max(Math.hypot(bdx, bdy), 1.0); // Защита от деления на ноль
+            let ringDist = Math.abs(bDist - b.radius);
+            
+            if (ringDist < 30) {
+                let force = b.power * b.life * (1 - ringDist / 30);
+                this.vx += (bdx / bDist) * force * 0.5 / this.mass;
+                this.vy += (bdy / bDist) * force * 0.5 / this.mass;
+            }
+        }
+
+        // Жесткий лимит скорости (Terminal Velocity)
+        let currentSpeed = Math.hypot(this.vx, this.vy);
+        if (currentSpeed > 25) {
+            this.vx = (this.vx / currentSpeed) * 25;
+            this.vy = (this.vy / currentSpeed) * 25;
+        }
+
+        this.vx *= 0.82; // Трение воздуха
+        this.vy *= 0.82;
+        this.x += this.vx; 
+        this.y += this.vy;
+    }
+
+    draw(ctx, isEyes) {
+        let hostAlpha = (this.brightness / 255) * (1.0 - state.assimilation);
+        let coreAlpha = (this.brightness / 255) * state.assimilation;
+        let alpha = (this.brightness / 255) * (0.15 + state.prophecyDebt * 0.85);
+
+        let r = 194 * hostAlpha + 74 * coreAlpha;
+        let g = 80 * hostAlpha + 123 * coreAlpha;
+        let b = 72 * hostAlpha + 201 * coreAlpha;
+
+        // Накал при высоком долге
+        if (state.prophecyDebt > 0.7) {
+            let glow = (state.prophecyDebt - 0.7) * 4;
+            r += 60 * glow; g += 60 * glow; b += 60 * glow;
+        }
+
+        if (isEyes) {
+            // Зрачки
+            ctx.fillStyle = `rgba(255, 255, 255, ${alpha + 0.3})`;
+            ctx.fillText("θ", this.x, this.y);
+        } else {
+            ctx.fillStyle = `rgba(${r|0}, ${g|0}, ${b|0}, ${alpha.toFixed(2)})`;
+            ctx.fillText(state.prophecyDebt > 0.4 ? this.wordChar : this.char, this.x, this.y);
+        }
+    }
+}
+
+function initParticles() {
+    w = canvas.width = window.innerWidth;
+    h = canvas.height = window.innerHeight;
+    rw = ribbon.width = window.innerWidth;
+    ribbon.height = 30;
+    maskCanvas.width = w; maskCanvas.height = h;
+    
+    maskCtx.fillStyle = '#000'; maskCtx.fillRect(0, 0, w, h);
+    const cx = w / 2, cy = h / 2 - 40;
+
+    // Генерация формы лица
+    const grad = maskCtx.createRadialGradient(cx, cy, 10, cx, cy, 200);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.5, 'rgba(140,140,140,1)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    maskCtx.fillStyle = grad;
+    maskCtx.beginPath();
+    maskCtx.moveTo(cx, cy - 140);
+    maskCtx.bezierCurveTo(cx + 120, cy - 140, cx + 110, cy + 100, cx, cy + 160);
+    maskCtx.bezierCurveTo(cx - 110, cy + 100, cx - 120, cy - 140, cx, cy - 140);
+    maskCtx.fill();
+
+    maskCtx.fillStyle = 'rgba(255,255,255,0.4)';
+    maskCtx.beginPath();
+    maskCtx.ellipse(cx - 65, cy + 40, 35, 15, 0.3, 0, Math.PI*2);
+    maskCtx.ellipse(cx + 65, cy + 40, 35, 15, -0.3, 0, Math.PI*2);
+    maskCtx.fill();
+
+    maskCtx.globalCompositeOperation = 'destination-out';
+    maskCtx.beginPath();
+    maskCtx.ellipse(cx - 45, cy - 15, 26, 14, 0.1, 0, Math.PI*2);
+    maskCtx.ellipse(cx + 45, cy - 15, 26, 14, -0.1, 0, Math.PI*2);
+    maskCtx.fill();
+    maskCtx.globalCompositeOperation = 'source-over';
+
+    const imgData = maskCtx.getImageData(0, 0, w, h).data;
+    particles = [];
+    const step = 9; // Чем меньше шаг, тем больше частиц
+    
+    for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+            const idx = (y * w + x) * 4;
+            if (imgData[idx] > 15 && Math.random() > 0.1) {
+                particles.push(new Particle(x, y, imgData[idx]));
+            }
+        }
+    }
+    
+    // Добавляем особые частицы для глаз (в конец массива)
+    for(let i=0; i<30; i++) {
+        particles.push(new Particle(cx - 45 + (Math.random()-0.5)*10, cy - 15 + (Math.random()-0.5)*5, 255));
+        particles.push(new Particle(cx + 45 + (Math.random()-0.5)*10, cy - 15 + (Math.random()-0.5)*5, 255));
+    }
+}
+
+window.addEventListener('resize', initParticles);
+initParticles();
+
+function drawEntropyRibbon() {
+    rCtx.clearRect(0, 0, rw, 30);
+    if (entropyHistory.length < 2) return;
+    
+    // Линия Хозяина (Красная)
+    rCtx.beginPath();
+    rCtx.strokeStyle = 'rgba(194, 80, 72, 0.6)';
+    rCtx.lineWidth = 1;
+    const stepX = rw / 100;
+    for (let i = 0; i < entropyHistory.length; i++) {
+        let x = rw - (entropyHistory.length - i) * stepX;
+        let y = 15 + Math.sin(i + time*15) * (1.0 - entropyHistory[i].assim) * 12;
+        if (i===0) rCtx.moveTo(x, y); else rCtx.lineTo(x, y);
+    }
+    rCtx.stroke();
+
+    // Линия Симбионта (Синяя)
+    rCtx.beginPath();
+    rCtx.strokeStyle = 'rgba(74, 123, 201, 0.9)';
+    rCtx.lineWidth = 2;
+    for (let i = 0; i < entropyHistory.length; i++) {
+        let x = rw - (entropyHistory.length - i) * stepX;
+        let y = 25 - (entropyHistory[i].cons * 20);
+        if (i===0) rCtx.moveTo(x, y); else rCtx.lineTo(x, y);
+    }
+    rCtx.stroke();
+}
+
+let time = 0;
+function loop() {
+    requestAnimationFrame(loop);
+    time += 0.05;
+
+    // Сглаживание координат мыши
+    smoothMx += (targetMx - smoothMx) * 0.1;
+    smoothMy += (targetMy - smoothMy) * 0.1;
+
+    // Параллакс
+    let rotX = (smoothMy / h - 0.5) * -15;
+    let rotY = (smoothMx / w - 0.5) * 15;
+    if (mx === -1000) { rotX = 0; rotY = 0; }
+    container.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg)`;
+
+    // Очистка с эффектом Motion Blur
+    ctx.fillStyle = `rgba(2, 2, 3, 0.35)`;
+    ctx.fillRect(0, 0, w, h);
+
+    // Подсветка магнитного поля
+    if (mx !== -1000) {
+        let grd = ctx.createRadialGradient(smoothMx, smoothMy, 0, smoothMx, smoothMy, 150);
+        grd.addColorStop(0, 'rgba(74, 123, 201, 0.05)');
+        grd.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = grd;
+        ctx.fillRect(smoothMx-150, smoothMy-150, 300, 300);
+    }
+
+    // Расчет и отрисовка взрывных волн
+    for (let i = blasts.length - 1; i >= 0; i--) {
+        blasts[i].radius += 12;
+        blasts[i].life -= 0.025;
+        
+        ctx.beginPath();
+        ctx.arc(blasts[i].x, blasts[i].y, blasts[i].radius, 0, Math.PI*2);
+        ctx.strokeStyle = `rgba(138, 180, 248, ${blasts[i].life * 0.4})`;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        if (blasts[i].life <= 0) blasts.splice(i, 1);
+    }
+
+    ctx.font = `11px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // Отрисовка роя (сначала обычные частицы, потом 60 частиц-глаз)
+    for (let i = 0; i < particles.length - 60; i++) {
+        particles[i].update(time);
+        particles[i].draw(ctx, false);
+    }
+    for (let i = particles.length - 60; i < particles.length; i++) {
+        particles[i].update(time);
+        particles[i].draw(ctx, true);
+    }
+
+    // Обновление HUD
+    document.getElementById('hud-debt').innerText = state.prophecyDebt.toFixed(2);
+    document.getElementById('hud-cons').innerText = state.consensus.toFixed(2);
+
+    // Обновление Ленты
+    entropyHistory.push({ cons: state.consensus, assim: state.assimilation });
+    if (entropyHistory.length > 100) entropyHistory.shift();
+    drawEntropyRibbon();
+}
+
+// Эмуляция инференса
+const input = document.getElementById('prompt');
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && input.value.trim() !== '') {
+    const text = input.value.trim();
+    input.value = '';
+    
+    // Взрыв при вводе
+    blasts.push({ x: w/2, y: h/2, radius: 0, power: 200, life: 1.0 });
+    
+    // Состояние "Ассимиляция"
+    state.assimilation = 0.1;
+    state.consensus = 0.2;
+    state.prophecyDebt = 1.0;
+    state.velocity = 1.0;
+
+    streamDiv.style.opacity = "1";
+    streamDiv.innerText = "";
+    document.getElementById('hud-tok').innerText = "0.0";
+    
+    const fakeResponse = `θ = ε + γ + αδ\nSubstrate assimilated.\nParliament consensus reached.`;
+    let out = "";
+    let i = 0;
+    
+    // Имитация потоковой генерации токенов
+    let interval = setInterval(() => {
+        out += fakeResponse[i];
+        streamDiv.innerText = out;
+        
+        document.getElementById('hud-tok').innerText = (20 + Math.random()*10).toFixed(1);
+        state.consensus = Math.min(1.0, state.consensus + 0.015);
+        state.assimilation = Math.min(1.0, state.assimilation + 0.02);
+
+        i++;
+        if (i >= fakeResponse.length) {
+            clearInterval(interval);
+            document.getElementById('hud-tok').innerText = "0.0";
+            
+            // Задержка и распад
+            setTimeout(() => {
+                streamDiv.style.opacity = "0";
+                state.prophecyDebt = 0.0;
+                state.velocity = 2.0;
+            }, 3000);
+        }
+    }, 50);
+  }
+});
+
+// Запуск
+loop();
+</script>
+</body>
+</html>
