@@ -419,16 +419,16 @@ function loop() {
     drawEntropyRibbon();
 }
 
-// Эмуляция инференса
+// Real inference via DOE --serve API
 const input = document.getElementById('prompt');
-input.addEventListener('keydown', (e) => {
+input.addEventListener('keydown', async (e) => {
   if (e.key === 'Enter' && input.value.trim() !== '') {
     const text = input.value.trim();
     input.value = '';
-    
+
     // Взрыв при вводе
     blasts.push({ x: w/2, y: h/2, radius: 0, power: 200, life: 1.0 });
-    
+
     // Состояние "Ассимиляция"
     state.assimilation = 0.1;
     state.consensus = 0.2;
@@ -438,33 +438,66 @@ input.addEventListener('keydown', (e) => {
     streamDiv.style.opacity = "1";
     streamDiv.innerText = "";
     document.getElementById('hud-tok').innerText = "0.0";
-    
-    const fakeResponse = `θ = ε + γ + αδ\nSubstrate assimilated.\nParliament consensus reached.`;
-    let out = "";
-    let i = 0;
-    
-    // Имитация потоковой генерации токенов
-    let interval = setInterval(() => {
-        out += fakeResponse[i];
-        streamDiv.innerText = out;
-        
-        document.getElementById('hud-tok').innerText = (20 + Math.random()*10).toFixed(1);
-        state.consensus = Math.min(1.0, state.consensus + 0.015);
-        state.assimilation = Math.min(1.0, state.assimilation + 0.02);
 
-        i++;
-        if (i >= fakeResponse.length) {
-            clearInterval(interval);
-            document.getElementById('hud-tok').innerText = "0.0";
-            
-            // Задержка и распад
-            setTimeout(() => {
-                streamDiv.style.opacity = "0";
-                state.prophecyDebt = 0.0;
-                state.velocity = 2.0;
-            }, 3000);
+    let out = "";
+    let tokenCount = 0;
+    const t0 = performance.now();
+
+    try {
+        const response = await fetch('/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                messages: [{ role: 'user', content: text }],
+                temperature: 0.8
+            })
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.done) break;
+                        if (data.token) {
+                            out += data.token;
+                            streamDiv.innerText = out;
+                            tokenCount++;
+
+                            const elapsed = (performance.now() - t0) / 1000;
+                            document.getElementById('hud-tok').innerText = (tokenCount / Math.max(elapsed, 0.01)).toFixed(1);
+                            state.consensus = Math.min(1.0, state.consensus + 0.01);
+                            state.assimilation = Math.min(1.0, state.assimilation + 0.015);
+
+                            // Micro-bursts on interesting tokens
+                            if (data.token.includes('.') || data.token.includes('?') || data.token.includes('!')) {
+                                blasts.push({ x: w/2 + (Math.random()-0.5)*200, y: h/2 + (Math.random()-0.5)*100, radius: 0, power: 40, life: 0.5 });
+                            }
+                        }
+                    } catch(e) {}
+                }
+            }
         }
-    }, 50);
+    } catch(err) {
+        out = "parliament unreachable: " + err.message;
+        streamDiv.innerText = out;
+    }
+
+    document.getElementById('hud-tok').innerText = "0.0";
+    setTimeout(() => {
+        streamDiv.style.opacity = "0";
+        state.prophecyDebt = 0.0;
+        state.velocity = 2.0;
+    }, 3000);
   }
 });
 

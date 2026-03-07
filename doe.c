@@ -41,6 +41,10 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
 #ifdef __linux__
   #include <sys/statvfs.h>
 #endif
@@ -1018,7 +1022,7 @@ typedef struct {
     int     tok_ht_cap;     /* hash table capacity (power of 2) */
 
     /* Chat template detection */
-    int     chat_style;     /* 0=raw, 1=chatml, 2=llama/mistral [INST], 3=zephyr, 4=phi, 5=gemma */
+    int     chat_style;     /* 0=raw, 1=chatml, 2=llama/mistral [INST], 3=zephyr, 4=phi, 5=gemma, 6=nanollama */
 
     /* Identity & gamma */
     int     weightless;     /* 1 if no doe_identity.gguf found */
@@ -1475,8 +1479,11 @@ static int index_load(GGUFIndex *ps, const char *path) {
            ps->rope_theta, ps->rms_norm_eps,
            ps->host_layers[0].bq ? "yes" : "no");
     if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE (%d merges)\n", ps->n_bpe_merges);
-    { const char *cs[] = {"raw","chatml","inst","zephyr","phi","gemma"};
-      printf("[doe] chat: %s\n", cs[ps->chat_style < 6 ? ps->chat_style : 0]); }
+    /* Auto-detect nanollama chat style from identity tag or vocab tokens */
+    if (ps->chat_style == 0 && (ps->identity_tag[0] ||
+        tok_lookup(ps, "<|user_start|>", 14) >= 0)) ps->chat_style = 6;
+    { const char *cs[] = {"raw","chatml","inst","zephyr","phi","gemma","nanollama"};
+      printf("[doe] chat: %s\n", cs[ps->chat_style < 7 ? ps->chat_style : 0]); }
     printf("[doe] LoRA rank=%d alpha=%.2f experts=%d/layer — parliament is alive.\n",
            ps->lora_rank, ps->lora_alpha, initial_experts);
     #undef PC
@@ -2127,6 +2134,36 @@ static void token_decode_print(GGUFIndex *ps, int token) {
     }
 }
 
+/* Decode token to buffer instead of stdout — for HTTP serve mode */
+static int token_decode_buf(GGUFIndex *ps, int token, char *buf, int bufsz) {
+    int pos = 0;
+    if (ps->vocab_tokens && token >= 0 && token < ps->vocab_size && ps->vocab_tokens[token]) {
+        const char *s = ps->vocab_tokens[token];
+        if (ps->is_gpt2_bpe) {
+            while (*s && pos < bufsz - 1) {
+                if ((unsigned char)s[0]==0xC4 && (unsigned char)s[1]==0xA0) { buf[pos++]=' '; s+=2; }
+                else if ((unsigned char)s[0]==0xC4 && (unsigned char)s[1]==0x8A) { buf[pos++]='\n'; s+=2; }
+                else { buf[pos++]=*s; s++; }
+            }
+        } else {
+            while (*s && pos < bufsz - 1) {
+                if ((unsigned char)s[0]==0xE2 && (unsigned char)s[1]==0x96 && (unsigned char)s[2]==0x81) {
+                    buf[pos++]=' '; s+=3;
+                } else if (!strncmp(s,"<0x",3) && s[5]=='>') {
+                    unsigned int b=0; sscanf(s+3,"%02X",&b);
+                    if (b>=32||b=='\n'||b=='\t') buf[pos++]=(char)b;
+                    s+=6;
+                } else { buf[pos++]=*s; s++; }
+            }
+        }
+    } else if (token >= 0 && token < 256) {
+        char c = (char)token;
+        if ((c>=32||c=='\n'||c=='\t') && pos < bufsz-1) buf[pos++]=c;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
 /* ── BPE Tokenizer — SentencePiece style, score-based merge ── */
 
 static int tok_lookup(GGUFIndex *ps, const char *s, int len); /* forward decl */
@@ -2265,7 +2302,9 @@ static int try_special_token(GGUFIndex *ps, const char *text, int tlen, int i, i
     static const char *specials[] = {
         "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|end|>",
         "<start_of_turn>", "<end_of_turn>", "<|user|>", "<|assistant|>",
-        "[INST]", "[/INST]", "<s>", "</s>", NULL
+        "[INST]", "[/INST]", "<s>", "</s>",
+        "<|user_start|>", "<|user_end|>", "<|assistant_start|>", "<|assistant_end|>",
+        "<|bos|>", "<|eot_id|>", NULL
     };
     if (text[i] != '<' && text[i] != '[') return -1;
     for (int s = 0; specials[s]; s++) {
@@ -2446,6 +2485,11 @@ static void chat(GGUFIndex *ps) {
                 use_template = 1;
             }
             break;
+        case 6: /* nanollama — <|user_start|>...<|user_end|><|assistant_start|> */
+            snprintf(wrapped, sizeof(wrapped),
+                "<|user_start|>%s<|user_end|><|assistant_start|>", input);
+            use_template = 1;
+            break;
         }
         if (!use_template) snprintf(wrapped, sizeof(wrapped), "%s", input);
 
@@ -2478,7 +2522,8 @@ static void chat(GGUFIndex *ps) {
                 const char *ts = ps->vocab_tokens[next];
                 if (strcmp(ts, "<|im_end|>") == 0 || strcmp(ts, "<|end|>") == 0 ||
                     strcmp(ts, "<|endoftext|>") == 0 || strcmp(ts, "<end_of_turn>") == 0 ||
-                    strcmp(ts, "<|user|>") == 0)
+                    strcmp(ts, "<|user|>") == 0 || strcmp(ts, "<|assistant_end|>") == 0 ||
+                    strcmp(ts, "<|eot_id|>") == 0)
                     break;
             }
 
@@ -2538,6 +2583,360 @@ static void chat(GGUFIndex *ps) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * HTTP SERVE MODE — minimal HTTP server for doe_ui.html and doe.html
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static int g_serve_port = 0; /* 0 = disabled */
+
+/* JSON-escape a string into buf. Returns bytes written (not counting NUL). */
+static int json_escape(const char *src, char *buf, int bufsz) {
+    int p = 0;
+    for (; *src && p < bufsz - 2; src++) {
+        switch (*src) {
+        case '"':  if(p+2<bufsz){buf[p++]='\\';buf[p++]='"';}  break;
+        case '\\': if(p+2<bufsz){buf[p++]='\\';buf[p++]='\\';} break;
+        case '\n': if(p+2<bufsz){buf[p++]='\\';buf[p++]='n';}  break;
+        case '\r': if(p+2<bufsz){buf[p++]='\\';buf[p++]='r';}  break;
+        case '\t': if(p+2<bufsz){buf[p++]='\\';buf[p++]='t';}  break;
+        default:   buf[p++] = *src; break;
+        }
+    }
+    buf[p] = '\0';
+    return p;
+}
+
+/* Read full HTTP request into buf, return total bytes. */
+static int http_read_request(int fd, char *buf, int bufsz) {
+    int total = 0;
+    int content_length = -1;
+    int header_end = -1;
+    while (total < bufsz - 1) {
+        int n = (int)read(fd, buf + total, bufsz - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        buf[total] = '\0';
+        /* Find end of headers */
+        if (header_end < 0) {
+            char *hdr_end = strstr(buf, "\r\n\r\n");
+            if (hdr_end) {
+                header_end = (int)(hdr_end - buf) + 4;
+                /* Parse Content-Length */
+                char *cl = strcasestr(buf, "content-length:");
+                if (cl) content_length = atoi(cl + 15);
+                else content_length = 0;
+            }
+        }
+        if (header_end >= 0 && total >= header_end + content_length) break;
+    }
+    return total;
+}
+
+/* Send full buffer over socket */
+static void http_send(int fd, const char *data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = (int)write(fd, data + sent, len - sent);
+        if (n <= 0) break;
+        sent += n;
+    }
+}
+
+/* Send HTTP response header */
+static void http_send_header(int fd, int status, const char *content_type, int content_length) {
+    char hdr[512];
+    const char *status_text = status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request";
+    int hlen;
+    if (content_length >= 0) {
+        hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n",
+            status, status_text, content_type, content_length);
+    } else {
+        /* Streaming (SSE) — no content-length */
+        hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: keep-alive\r\n\r\n",
+            status, status_text, content_type);
+    }
+    http_send(fd, hdr, hlen);
+}
+
+/* Serve a static file (doe_ui.html, doe.html) */
+static int http_serve_file(int fd, const char *filepath) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *data = malloc(sz);
+    if (!data) { fclose(f); return 0; }
+    fread(data, 1, sz, f); fclose(f);
+    http_send_header(fd, 200, "text/html; charset=utf-8", (int)sz);
+    http_send(fd, data, (int)sz);
+    free(data);
+    return 1;
+}
+
+/* Extract JSON string value for a key from body. Simple parser. */
+static int json_get_string(const char *json, const char *key, char *out, int outsz) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return 0;
+    while (*p && (*p == ':' || *p == ' ' || *p == '\t')) p++;
+    if (*p != '"') return 0;
+    p++;
+    int i = 0;
+    while (*p && *p != '"' && i < outsz - 1) {
+        if (*p == '\\' && p[1]) { p++; /* skip escape */ }
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return i;
+}
+
+/* Extract last user message from messages array in chat/completions body */
+static int json_get_last_user_message(const char *body, char *out, int outsz) {
+    /* Find last "role":"user" ... "content":"..." */
+    const char *last_user = NULL;
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        const char *rv = strstr(p, "\"user\"");
+        if (rv && rv - p < 30) last_user = p;
+        p++;
+    }
+    if (!last_user) return 0;
+    return json_get_string(last_user, "content", out, outsz);
+}
+
+static float json_get_float(const char *json, const char *key, float def) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return def;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return def;
+    return (float)atof(p + 1);
+}
+
+/* Run inference and stream SSE tokens */
+static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, float temperature) {
+    int max_seq = 512;
+    InferState is = alloc_infer(ps, max_seq);
+
+    /* Reset KV cache */
+    int kd = ps->host_kv_heads * ps->host_head_dim;
+    memset(is.key_cache, 0, ps->host_n_layers * max_seq * kd * 4);
+    memset(is.value_cache, 0, ps->host_n_layers * max_seq * kd * 4);
+
+    /* Wrap input in chat template */
+    char wrapped[2048];
+    switch (ps->chat_style) {
+    case 1: snprintf(wrapped, sizeof(wrapped), "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_msg); break;
+    case 2: snprintf(wrapped, sizeof(wrapped), "[INST] %s [/INST]", user_msg); break;
+    case 3: snprintf(wrapped, sizeof(wrapped), "<|user|>\n%s\n<|assistant|>\n", user_msg); break;
+    case 4: snprintf(wrapped, sizeof(wrapped), "<|user|>\n%s<|end|>\n<|assistant|>\n", user_msg); break;
+    case 5: snprintf(wrapped, sizeof(wrapped), "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", user_msg); break;
+    case 6: snprintf(wrapped, sizeof(wrapped), "<|user_start|>%s<|user_end|><|assistant_start|>", user_msg); break;
+    default: snprintf(wrapped, sizeof(wrapped), "%s", user_msg); break;
+    }
+
+    /* Tokenize */
+    int input_tokens[512];
+    int n_input = 0;
+    if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
+    n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
+
+    /* Prefill */
+    int pos = 0;
+    for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++)
+        doe_forward(ps, &is, input_tokens[i], pos);
+
+    int prev = input_tokens[n_input - 1];
+
+    /* Generate tokens, stream as SSE */
+    for (int i = 0; i < 256 && pos < max_seq; i++, pos++) {
+        float *lg = doe_forward(ps, &is, prev, pos);
+        field_step(1.0f);
+        apply_field_to_logits(lg, ps->host_vocab);
+
+        float temp = temperature > 0.01f ? temperature : F.effective_temp;
+        int next = sample(lg, ps->host_vocab, temp, 40);
+
+        /* Stop on EOS */
+        if (next == ps->eos_id) break;
+        if (ps->vocab_tokens && next >= 0 && next < ps->vocab_size && ps->vocab_tokens[next]) {
+            const char *ts = ps->vocab_tokens[next];
+            if (strcmp(ts, "<|im_end|>") == 0 || strcmp(ts, "<|end|>") == 0 ||
+                strcmp(ts, "<|endoftext|>") == 0 || strcmp(ts, "<end_of_turn>") == 0 ||
+                strcmp(ts, "<|user|>") == 0 || strcmp(ts, "<|assistant_end|>") == 0 ||
+                strcmp(ts, "<|eot_id|>") == 0) break;
+        }
+
+        /* Prophecy debt + Hebbian update */
+        float pd = compute_prophecy_debt(lg, next, ps->host_vocab);
+        F.debt += pd;
+        float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
+        for (int l = 0; l < ps->n_field_layers; l++) {
+            FieldLayer *fl = &ps->field_layers[l];
+            for (int e = 0; e < MAX_EXPERTS; e++) {
+                if (!fl->experts[e].alive || fl->experts[e].tokens_seen == 0) continue;
+                notorch_step(fl->experts[e].lora_A, fl->experts[e].lora_B,
+                            ps->host_dim, ps->host_dim, ps->lora_rank,
+                            is.x, is.xb, learn_signal);
+            }
+        }
+
+        /* Decode token to buffer */
+        char tokbuf[256], escaped[512];
+        token_decode_buf(ps, next, tokbuf, sizeof(tokbuf));
+        json_escape(tokbuf, escaped, sizeof(escaped));
+
+        /* Send SSE event */
+        char sse[1024];
+        int slen = snprintf(sse, sizeof(sse), "data: {\"token\":\"%s\"}\n\n", escaped);
+        int wr = (int)write(fd, sse, slen);
+        if (wr <= 0) break; /* client disconnected */
+
+        prev = next;
+    }
+
+    /* Send done event */
+    write(fd, "data: {\"done\":true}\n\n", 20);
+    free_infer(&is);
+}
+
+/* Main HTTP serve loop */
+static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
+    signal(SIGPIPE, SIG_IGN); /* ignore broken pipes */
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("[serve] socket"); return; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(g_serve_port);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("[serve] bind"); close(server_fd); return;
+    }
+    if (listen(server_fd, 8) < 0) {
+        perror("[serve] listen"); close(server_fd); return;
+    }
+
+    /* Resolve HTML file paths relative to executable */
+    char ui_path[512], vis_path[512];
+    snprintf(ui_path, sizeof(ui_path), "%sdoe_ui.html", exe_dir);
+    snprintf(vis_path, sizeof(vis_path), "%sdoe.html", exe_dir);
+
+    printf("[serve] parliament listening on http://0.0.0.0:%d\n", g_serve_port);
+    printf("[serve]   /         → chat UI\n");
+    printf("[serve]   /visual   → symbiont terminal\n");
+    printf("[serve]   /health   → status\n");
+    printf("[serve]   POST /chat/completions → inference stream\n\n");
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client < 0) continue;
+
+        char req[8192];
+        int reqlen = http_read_request(client, req, sizeof(req));
+        if (reqlen <= 0) { close(client); continue; }
+
+        /* Parse method and path */
+        char method[8] = "", path[256] = "";
+        sscanf(req, "%7s %255s", method, path);
+
+        /* Handle CORS preflight */
+        if (strcmp(method, "OPTIONS") == 0) {
+            const char *cors = "HTTP/1.1 204 No Content\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Content-Type\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n\r\n";
+            http_send(client, cors, (int)strlen(cors));
+            close(client);
+            continue;
+        }
+
+        if (strcmp(method, "GET") == 0) {
+            if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
+                if (!http_serve_file(client, ui_path)) {
+                    const char *msg = "doe_ui.html not found";
+                    http_send_header(client, 404, "text/plain", (int)strlen(msg));
+                    http_send(client, msg, (int)strlen(msg));
+                }
+            } else if (strcmp(path, "/visual") == 0) {
+                if (!http_serve_file(client, vis_path)) {
+                    const char *msg = "doe.html not found";
+                    http_send_header(client, 404, "text/plain", (int)strlen(msg));
+                    http_send(client, msg, (int)strlen(msg));
+                }
+            } else if (strcmp(path, "/health") == 0) {
+                char body[512];
+                int blen = snprintf(body, sizeof(body),
+                    "{\"status\":\"ok\",\"model\":\"%s\",\"arch\":\"%s\","
+                    "\"params\":\"%dM\",\"vocab\":%d,\"layers\":%d,"
+                    "\"experts\":%d,\"debt\":%.4f,\"health\":%.4f}",
+                    ps->host_path, ps->host_arch,
+                    (int)(ps->host_vocab * ps->host_dim * 2 / 1000000),
+                    ps->host_vocab, ps->host_n_layers,
+                    ps->n_field_layers > 0 ? ps->field_layers[0].n_alive : 0,
+                    F.debt, F.field_health);
+                http_send_header(client, 200, "application/json", blen);
+                http_send(client, body, blen);
+            } else {
+                const char *msg = "not found";
+                http_send_header(client, 404, "text/plain", (int)strlen(msg));
+                http_send(client, msg, (int)strlen(msg));
+            }
+        } else if (strcmp(method, "POST") == 0 &&
+                   (strcmp(path, "/chat/completions") == 0 || strcmp(path, "/v1/chat/completions") == 0)) {
+            /* Find body after \r\n\r\n */
+            char *body = strstr(req, "\r\n\r\n");
+            if (!body) { close(client); continue; }
+            body += 4;
+
+            char user_msg[2048] = "";
+            json_get_last_user_message(body, user_msg, sizeof(user_msg));
+
+            if (user_msg[0] == '\0') {
+                const char *err = "{\"error\":\"no user message\"}";
+                http_send_header(client, 400, "application/json", (int)strlen(err));
+                http_send(client, err, (int)strlen(err));
+            } else {
+                float temp = json_get_float(body, "temperature", 0.0f);
+                printf("[serve] inference: \"%.*s\" temp=%.2f\n",
+                       (int)(strlen(user_msg) > 60 ? 60 : strlen(user_msg)), user_msg, temp);
+                http_send_header(client, 200, "text/event-stream", -1);
+                http_stream_inference(client, ps, user_msg, temp);
+            }
+        } else {
+            const char *msg = "method not allowed";
+            http_send_header(client, 400, "text/plain", (int)strlen(msg));
+            http_send(client, msg, (int)strlen(msg));
+        }
+
+        close(client);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * MAIN — the field manifests.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
@@ -2552,9 +2951,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) { g_n_threads = atoi(argv[++i]); if (g_n_threads < 1) g_n_threads = 1; }
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
+        else if (strcmp(argv[i], "--serve") == 0 && i+1 < argc) { g_serve_port = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("doe.c — DOE: inference architecture over any GGUF\n\n");
             printf("  --model PATH    GGUF to index (or auto-detect)\n");
+            printf("  --serve PORT    start HTTP server for UI (doe_ui.html, doe.html)\n");
             printf("  --threads N     CPU threads for matvec (default: all cores)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
@@ -2708,8 +3109,19 @@ int main(int argc, char **argv) {
     if (mycelium_load(&idx, idx.profile.fingerprint))
         printf("[mycelium] resumed adaptation for this index.\n");
 
-    /* ── Chat ── */
-    chat(&idx);
+    /* ── Chat or Serve ── */
+    if (g_serve_port > 0) {
+        /* Resolve directory of the executable for HTML files */
+        char exe_dir[512] = "./";
+        {
+            /* Try to find doe_ui.html relative to argv[0] */
+            char *slash = strrchr(argv[0], '/');
+            if (slash) { int dlen = (int)(slash - argv[0]) + 1; if (dlen < 500) { memcpy(exe_dir, argv[0], dlen); exe_dir[dlen] = '\0'; } }
+        }
+        serve_loop(&idx, exe_dir);
+    } else {
+        chat(&idx);
+    }
 
     /* ── Save spore on exit ── */
     mycelium_save(&idx, F.step, F.field_health);
