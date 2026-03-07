@@ -335,7 +335,7 @@ static void field_init(void) {
     F.expert_precise = 0.25f;
     calendar_init();
     field_mlp_init();
-    printf("[doe] θ = ε + γ + αδ — symbiont awakens. prophecy=%d destiny=%.2f\n",
+    printf("[doe] θ = ε + γ + αδ — parliament awakens. prophecy=%d destiny=%.2f\n",
            F.prophecy, F.destiny);
 }
 
@@ -672,8 +672,8 @@ static float expert_resonance(float expert_freq, HarmonicState *hs) {
  * L2 norms per layer, spectral density, dead neuron ratio.
  * this tells DOE where to focus its LoRA experts.
  *
- * a symbiont that doesn't know its host is a parasite.
- * a symbiont that knows its host is an extension of it.
+ * the index is read-only. DOE is the architecture.
+ * weak layers get more LoRA. healthy layers get less.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     float l2_norm;            /* L2 norm of layer weights */
@@ -828,7 +828,7 @@ typedef struct {
     /* f16→f32 conversion buffers (must be freed on cleanup) */
     float **f16_bufs;
     int     n_f16_bufs;
-} Symbiont;
+} GGUFIndex;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
 
@@ -933,8 +933,8 @@ static void env_scan(Environment *env, const char *self_src) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SYMBIONT LOAD — mmap host GGUF, wire weight pointers, profile, attach LoRA.
- * the host swims. the symbiont steers.
+ * INDEX LOAD — mmap GGUF, wire weight pointers, profile layers, attach LoRA.
+ * the weights are substrate. DOE is the architecture.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static void init_lora_expert(LoraExpert *e, int dim, int rank, float freq) {
     e->lora_A = calloc(dim * rank, sizeof(float));
@@ -956,14 +956,14 @@ static void free_lora_expert(LoraExpert *e) {
     e->alive = 0; e->vitality = 0;
 }
 
-static int symbiont_load(Symbiont *ps, const char *path) {
-    memset(ps, 0, sizeof(Symbiont));
+static int index_load(GGUFIndex *ps, const char *path) {
+    memset(ps, 0, sizeof(GGUFIndex));
     snprintf(ps->host_path, 256, "%s", path);
     ps->lora_rank = LORA_RANK;
     ps->lora_alpha = F.lora_alpha;
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { printf("[symbiont] cannot open %s\n", path); return 0; }
+    if (fd < 0) { printf("[doe] cannot open %s\n", path); return 0; }
     struct stat st; fstat(fd, &st);
     ps->mmap_size = st.st_size;
     ps->mmap_base = mmap(NULL, ps->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -1046,7 +1046,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     uint64_t header_size = p - ps->mmap_base;
     uint64_t data_start = ((header_size + 31) / 32) * 32;
 
-    /* f16→f32 conversion buffers — tracked in Symbiont for cleanup */
+    /* f16→f32 conversion buffers — tracked in GGUFIndex for cleanup */
     ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
 
     /* Wire weight pointers */
@@ -1108,7 +1108,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     free(tinfo);
 
     if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
-        printf("[symbiont] host missing essential weights. abandoning.\n");
+        printf("[doe] host missing essential weights. abandoning.\n");
         goto bail;
     }
 
@@ -1117,7 +1117,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++)
         if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) has_ffn = 1;
     if (!has_ffn) {
-        printf("[symbiont] host has no standard FFN. DOE needs a plain transformer.\n");
+        printf("[doe] host has no standard FFN. DOE needs a plain transformer.\n");
         goto bail;
     }
 
@@ -1165,7 +1165,7 @@ static int symbiont_load(Symbiont *ps, const char *path) {
             if (e < initial_experts) {
                 float freq = 6.2831853f * e / initial_experts;
                 init_lora_expert(&fl->experts[e], ps->host_dim, ps->lora_rank, freq);
-                /* Weaker layers get stronger initial LoRA — the symbiont compensates */
+                /* Weaker layers get stronger initial LoRA — DOE compensates */
                 if (layer_health < 0.5f) {
                     float boost = (0.5f - layer_health) * 2.0f;
                     for (int i = 0; i < ps->host_dim * ps->lora_rank; i++) {
@@ -1180,10 +1180,10 @@ static int symbiont_load(Symbiont *ps, const char *path) {
     }
 
     ps->active = 1;
-    printf("[symbiont] attached to %s (arch=%s dim=%d layers=%d heads=%d vocab=%d %.1fMB)\n",
+    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d vocab=%d %.1fMB)\n",
            path, ps->host_arch, ps->host_dim, ps->host_n_layers, ps->host_heads,
            ps->host_vocab, (float)ps->mmap_size/(1024*1024));
-    printf("[symbiont] LoRA rank=%d alpha=%.2f experts=%d/layer — the symbiont is alive.\n",
+    printf("[doe] LoRA rank=%d alpha=%.2f experts=%d/layer — parliament is alive.\n",
            ps->lora_rank, ps->lora_alpha, initial_experts);
     #undef PC
     return 1;
@@ -1191,11 +1191,11 @@ bail:
     for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
     free(ps->f16_bufs); ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
-    printf("[symbiont] GGUF parse failed. the symbiont dissipates.\n");
+    printf("[doe] GGUF parse failed.\n");
     return 0;
 }
 
-static void symbiont_free(Symbiont *ps) {
+static void index_free(GGUFIndex *ps) {
     for (int l = 0; l < ps->n_field_layers; l++) {
         free(ps->field_layers[l].parliament.w_vote);
         for (int e = 0; e < MAX_EXPERTS; e++)
@@ -1205,7 +1205,7 @@ static void symbiont_free(Symbiont *ps) {
     for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
     free(ps->f16_bufs);
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
-    memset(ps, 0, sizeof(Symbiont));
+    memset(ps, 0, sizeof(GGUFIndex));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1380,7 +1380,7 @@ typedef struct {
 
 static void drift_init(CalendarDrift *cd) { memset(cd, 0, sizeof(CalendarDrift)); }
 
-static void drift_snapshot(CalendarDrift *cd, float loss, Symbiont *ps, HarmonicState *hs) {
+static void drift_snapshot(CalendarDrift *cd, float loss, GGUFIndex *ps, HarmonicState *hs) {
     DriftSnapshot *ds = &cd->history[cd->head % DRIFT_SNAPSHOTS];
     ds->step = F.step;
     int total_exp = 0;
@@ -1490,7 +1490,7 @@ static void mycelium_init(MyceliumState *ms) {
     mkdir(MYCELIUM_DIR, 0755);
 }
 
-static void mycelium_save(Symbiont *ps, int step, float fitness) {
+static void mycelium_save(GGUFIndex *ps, int step, float fitness) {
     char path[256];
     snprintf(path, 256, "%s/spore_%016llx_s%d.bin", MYCELIUM_DIR,
              (unsigned long long)ps->profile.fingerprint, step);
@@ -1525,7 +1525,7 @@ static void mycelium_save(Symbiont *ps, int step, float fitness) {
     printf("[mycelium] spore saved: %s (fitness=%.3f)\n", path, fitness);
 }
 
-static int mycelium_load(Symbiont *ps, uint64_t target_fp) {
+static int mycelium_load(GGUFIndex *ps, uint64_t target_fp) {
     /* scan directory for best matching spore */
     char pattern[256];
     snprintf(pattern, 256, "%s/spore_%016llx_*.bin", MYCELIUM_DIR, (unsigned long long)target_fp);
@@ -1620,7 +1620,7 @@ typedef struct {
     int max_seq;
 } InferState;
 
-static InferState alloc_infer(Symbiont *ps, int max_seq) {
+static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     InferState s = {0};
     int D = ps->host_dim, kd = ps->host_kv_heads * ps->host_head_dim;
     int H = ps->host_hidden;
@@ -1658,7 +1658,7 @@ static void free_infer(InferState *s) {
     memset(s, 0, sizeof(InferState));
 }
 
-static float *symbiont_forward(Symbiont *ps, InferState *s, int token, int pos) {
+static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     int D = ps->host_dim, hd = ps->host_head_dim;
     int kd = ps->host_kv_heads * hd;
     int H = ps->host_hidden;
@@ -1786,7 +1786,7 @@ static void byte_decode_print(int token) {
     }
 }
 
-static void chat(Symbiont *ps) {
+static void chat(GGUFIndex *ps) {
     int max_seq = 512;
     InferState is = alloc_infer(ps, max_seq);
     CalendarDrift cd; drift_init(&cd);
@@ -1835,14 +1835,14 @@ static void chat(Symbiont *ps) {
         /* Byte-level encode input */
         int pos = 0;
         for (int i = 0; i < len && pos < max_seq - 1; i++, pos++)
-            symbiont_forward(ps, &is, (unsigned char)input[i], pos);
+            doe_forward(ps, &is, (unsigned char)input[i], pos);
 
         int prev = (unsigned char)input[len-1];
         printf("  ");
         int total_births = 0, total_deaths = 0;
 
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
-            float *lg = symbiont_forward(ps, &is, prev, pos);
+            float *lg = doe_forward(ps, &is, prev, pos);
 
             /* Field modulation on logits */
             field_step(1.0f);
@@ -1911,7 +1911,7 @@ static void chat(Symbiont *ps) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("\n  doe.c — Democracy of Experts\n");
-    printf("  θ = ε + γ + αδ — the symbiont awakens.\n\n");
+    printf("  θ = ε + γ + αδ — the parliament awakens.\n\n");
 
     char gguf_path[256] = "";
 
@@ -1920,8 +1920,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("doe.c — DOE: symbiont inference over any GGUF\n\n");
-            printf("  --model PATH    path to host GGUF (or auto-detect)\n");
+            printf("doe.c — DOE: inference architecture over any GGUF\n\n");
+            printf("  --model PATH    GGUF to index (or auto-detect)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
             printf("  --lora-rank N   LoRA rank (default: 16)\n");
@@ -1939,7 +1939,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) F.prophecy = atoi(argv[++i]);
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) F.destiny = atof(argv[++i]);
-        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { /* handled in symbiont */ }
+        else if (strcmp(argv[i], "--lora-rank") == 0 && i+1 < argc) { /* handled in index_load */ }
         else if (strcmp(argv[i], "--lora-alpha") == 0 && i+1 < argc) F.lora_alpha = atof(argv[++i]);
     }
 
@@ -1964,27 +1964,27 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ── Attach symbiont ── */
-    Symbiont symbiont;
-    if (!symbiont_load(&symbiont, gguf_path)) {
-        fprintf(stderr, "[error] failed to attach to %s\n", gguf_path);
+    /* ── Index GGUF ── */
+    GGUFIndex idx;
+    if (!index_load(&idx, gguf_path)) {
+        fprintf(stderr, "[error] failed to index %s\n", gguf_path);
         return 1;
     }
 
     /* ── Mycelium — check for existing LoRA spores ── */
     MyceliumState mycelium;
     mycelium_init(&mycelium);
-    if (mycelium_load(&symbiont, symbiont.profile.fingerprint))
+    if (mycelium_load(&idx, idx.profile.fingerprint))
         printf("[mycelium] resumed adaptation for this index.\n");
 
     /* ── Chat ── */
-    chat(&symbiont);
+    chat(&idx);
 
     /* ── Save spore on exit ── */
-    mycelium_save(&symbiont, F.step, F.field_health);
+    mycelium_save(&idx, F.step, F.field_health);
 
     /* ── Cleanup ── */
-    symbiont_free(&symbiont);
+    index_free(&idx);
     printf("[doe] the parliament adjourns. θ persists.\n");
     return 0;
 }
