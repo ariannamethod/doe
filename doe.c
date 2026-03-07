@@ -40,6 +40,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <dirent.h>
 #ifdef __linux__
   #include <sys/statvfs.h>
 #endif
@@ -2592,22 +2593,48 @@ int main(int argc, char **argv) {
     {
         static const char *wdirs[] = { "weights/", "doe_w/", "./", "../weights/", NULL };
         struct stat st;
+        /* Search for doe_identity*.gguf (any variant: _micro, _mini, _q8, etc.) */
         for (int d = 0; wdirs[d] && identity_path[0] == '\0'; d++) {
-            char tmp[256];
-            snprintf(tmp, 256, "%sdoe_identity.gguf", wdirs[d]);
-            if (stat(tmp, &st) == 0 && st.st_size > 0) {
-                snprintf(identity_path, 256, "%s", tmp);
-                printf("[identity] found: %s (%.1fMB)\n", tmp, (float)st.st_size/(1024*1024));
+            DIR *dir = opendir(wdirs[d]);
+            if (!dir) continue;
+            struct dirent *ent;
+            int64_t best_size = 0;
+            while ((ent = readdir(dir)) != NULL) {
+                if (strncmp(ent->d_name, "doe_identity", 12) != 0) continue;
+                int nlen = (int)strlen(ent->d_name);
+                if (nlen < 5 || strcmp(ent->d_name + nlen - 5, ".gguf") != 0) continue;
+                char tmp[256];
+                snprintf(tmp, 256, "%s%s", wdirs[d], ent->d_name);
+                if (stat(tmp, &st) == 0 && st.st_size > best_size) {
+                    snprintf(identity_path, 256, "%s", tmp);
+                    best_size = st.st_size;
+                }
+            }
+            closedir(dir);
+            if (identity_path[0] != '\0') {
+                stat(identity_path, &st);
+                printf("[identity] found: %s (%.1fMB)\n", identity_path, (float)st.st_size/(1024*1024));
                 weightless = 0;
             }
         }
+        /* Search for doe_gamma*.bin or doe_gamma*.npz */
         for (int d = 0; wdirs[d] && gamma_path[0] == '\0'; d++) {
-            char tmp[256];
-            snprintf(tmp, 256, "%sdoe_gamma.bin", wdirs[d]);
-            if (stat(tmp, &st) == 0 && st.st_size > 0) {
-                snprintf(gamma_path, 256, "%s", tmp);
-                printf("[gamma] found: %s (%.1fMB)\n", tmp, (float)st.st_size/(1024*1024));
+            DIR *dir = opendir(wdirs[d]);
+            if (!dir) continue;
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                if (strncmp(ent->d_name, "doe_gamma", 9) == 0 ||
+                    strncmp(ent->d_name, "gamma_", 6) == 0) {
+                    char tmp[256];
+                    snprintf(tmp, 256, "%s%s", wdirs[d], ent->d_name);
+                    if (stat(tmp, &st) == 0 && st.st_size > 0) {
+                        snprintf(gamma_path, 256, "%s", tmp);
+                        printf("[gamma] found: %s (%.1fMB)\n", tmp, (float)st.st_size/(1024*1024));
+                        break;
+                    }
+                }
             }
+            closedir(dir);
         }
         if (weightless)
             printf("[identity] no doe_identity.gguf — weightless mode.\n");
