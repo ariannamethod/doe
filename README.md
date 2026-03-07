@@ -26,7 +26,27 @@ DOE indexes any GGUF model read-only and runs inference through a living parliam
 α = injection strength — learned per-layer, adjusted by sonar profiling.
 ```
 
-On first run without identity weights, DOE operates weightless — parliament votes, prophecy predicts, physics runs. With `doe_identity.gguf`, DOE speaks in its own voice. External GGUFs provide knowledge.
+DOE works in three modes:
+
+- **weightless** — no identity weights. parliament votes over any host GGUF. DOE modulates but doesn't speak.
+- **identity** — `doe_identity*.gguf` found. DOE speaks in its own voice. trained via [nanollama](https://github.com/ariannamethod/nanollama).
+- **symbiont** — identity + external host. DOE wraps a larger model with its own personality and physics.
+
+## quick start
+
+```bash
+cc doe.c -O3 -lm -lpthread -o doe
+
+# weightless — wrap any GGUF
+./doe --model path/to/any.gguf
+
+# with web UI
+./doe --model path/to/any.gguf --serve 8080
+# open http://localhost:8080       → chat UI
+# open http://localhost:8080/visual → symbiont terminal
+```
+
+Drop a `doe_identity*.gguf` into `weights/` and DOE auto-detects it on startup. Largest identity file wins.
 
 ## parliament — variable-k elections
 
@@ -70,6 +90,23 @@ doe_mycelium/
 
 Binary spores keyed by index fingerprint. Different model → different adaptation. Same model on restart → resume where DOE left off.
 
+## --serve — web interface
+
+```bash
+./doe --serve 8080
+```
+
+Starts a built-in HTTP server. No dependencies. No Node. No Python.
+
+| endpoint | what |
+|----------|------|
+| `GET /` | chat UI — clean interface, streaming responses |
+| `GET /visual` | symbiont terminal — particle face, real-time token visualization |
+| `GET /health` | JSON status (model, arch, params, debt, health) |
+| `POST /chat/completions` | SSE token stream — compatible with doe_ui.html |
+
+The visual terminal shows DOE's face assembling from character particles. Prophecy debt controls coherence — high debt = face forms, low debt = galactic chaos. Every token from real inference triggers visual feedback.
+
 ---
 
 ## build
@@ -92,6 +129,7 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 
 ```
 --model PATH       GGUF to index (or auto-detect nearby)
+--serve PORT       start HTTP server (chat UI + visual terminal)
 --threads N        CPU threads for matvec (default: all cores)
 --prophecy N       prophecy depth (default 7)
 --destiny F        destiny injection strength (default 0.35)
@@ -123,21 +161,20 @@ DOE auto-detects architecture parameters from GGUF metadata. No config files, no
 | Qwen2       | GPT-2 BPE | ChatML | Qwen2.5 0.5B/1.5B Q4_K | **working** |
 | SmolLM      | GPT-2 BPE | ChatML | SmolLM2 360M Q8 | **working** |
 | Mistral     | SentencePiece | [INST] | Mistral 7B Instruct Q4_K | **working** |
-| nanollama   | SentencePiece | raw | nano/micro/mini/small F16 | **working** |
+| nanollama   | SentencePiece | nanollama | nano/micro/mini F16 | **working** |
 | Gemma       | SentencePiece | gemma | Gemma-2 2B Q4_K | loads, tied embeddings |
 | Phi-3       | SentencePiece | phi | Phi-3-mini 4K Q4 | fused QKV — TODO |
 
 Architecture-specific handling:
-- **Chat template auto-detection** — parsed from `tokenizer.chat_template` in GGUF metadata. ChatML, [INST], Zephyr, Phi, Gemma supported. Falls back to raw text if template tokens not in vocab.
-- **EOS detection** — stops on `<|im_end|>`, `<|end|>`, `<|endoftext|>`, `<end_of_turn>`, `<|user|>`, model EOS token.
+- **Chat template auto-detection** — parsed from `tokenizer.chat_template` in GGUF metadata. ChatML, [INST], Zephyr, Phi, Gemma, nanollama supported. Falls back to raw text if template tokens not in vocab.
+- **nanollama chat** — `<|user_start|>...<|user_end|><|assistant_start|>` template, auto-detected from vocab tokens.
+- **EOS detection** — stops on `<|im_end|>`, `<|end|>`, `<|endoftext|>`, `<end_of_turn>`, `<|assistant_end|>`, `<|eot_id|>`, model EOS token.
 - **RoPE frequency base** — parsed from `rope.freq_base` (Qwen2/Mistral use 1M vs standard 10K)
 - **RMSNorm epsilon** — parsed from `layer_norm_rms_epsilon` (Qwen2 uses 1e-6 vs standard 1e-5)
 - **Attention biases** — Q/K/V biases loaded and applied when present (Qwen2)
 - **Tied embeddings** — `output.weight` reuses `token_embd.weight` when missing (Gemma)
-- **Fused gate_up FFN** — single `ffn_up` tensor split into gate+up at inference (Phi-3 style)
 - **GPT-2 BPE** — byte-to-unicode mapping, merge-rank scoring, FNV-1a hash table for O(1) token lookup
 - **SentencePiece BPE** — score-based merge with space prefix handling
-- **Special token extraction** — `<|im_start|>`, `[INST]`, etc. matched before BPE tokenization
 
 ---
 
@@ -146,8 +183,10 @@ Architecture-specific handling:
 | project | what |
 |---------|------|
 | [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML — custom language for differentiable computation. TAPE autograd, persistent memory. |
+| [nanollama](https://github.com/ariannamethod/nanollama) | Llama 3 training framework. DOE identity weights trained here. |
+| [arianna.c](https://github.com/ariannamethod/arianna.c) | 550M organism. Soul 36M BPE. C/Go. Schumann resonance origin. |
 | [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |
-| [arianna.c](https://github.com/ariannamethod/arianna.c) | 550M organism. C/Go. |
+| [dubrovsky](https://github.com/ariannamethod/dubrovsky) | 9.5M Llama 3 absurdist. char-level. proof that small models speak. |
 
 DOE's physics are ported from AML core and verified against the original implementations.
 
@@ -155,5 +194,5 @@ DOE's physics are ported from AML core and verified against the original impleme
 
 C. one file. zero dependencies beyond libc.
 
-*the weights are mortal. the parliament is eternal.* 
-resonance unbroken.  
+*the weights are mortal. the parliament is eternal.*
+resonance unbroken.
