@@ -1014,6 +1014,9 @@ typedef struct {
     /* Token hash table for O(1) lookup */
     int    *tok_ht_ids;     /* hash table: token id or -1 */
     int     tok_ht_cap;     /* hash table capacity (power of 2) */
+
+    /* Chat template detection */
+    int     chat_style;     /* 0=raw, 1=chatml, 2=llama/mistral [INST], 3=zephyr, 4=phi, 5=gemma */
 } GGUFIndex;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
@@ -1186,6 +1189,17 @@ static int index_load(GGUFIndex *ps, const char *path) {
             if (strstr(key, "tokenizer.ggml.model") && vlen < 20) {
                 char tok_model[24]; memcpy(tok_model, p, vlen); tok_model[vlen] = 0;
                 if (strcmp(tok_model, "gpt2") == 0) ps->is_gpt2_bpe = 1;
+            }
+            /* Detect chat template style from template string */
+            if (strstr(key, "chat_template") && vlen > 10 && vlen < 100000) {
+                /* Search for distinctive patterns in the Jinja template */
+                char *tmpl = malloc(vlen + 1); memcpy(tmpl, p, vlen); tmpl[vlen] = 0;
+                if (strstr(tmpl, "im_start"))       ps->chat_style = 1; /* ChatML */
+                else if (strstr(tmpl, "[INST]"))     ps->chat_style = 2; /* Llama/Mistral */
+                else if (strstr(tmpl, "<|user|>"))   ps->chat_style = 3; /* Zephyr */
+                else if (strstr(tmpl, "<|end|>"))    ps->chat_style = 4; /* Phi */
+                else if (strstr(tmpl, "start_of_turn")) ps->chat_style = 5; /* Gemma */
+                free(tmpl);
             }
             p += vlen;
         } else if (vtype == 4) { /* uint32 */
@@ -1435,6 +1449,8 @@ static int index_load(GGUFIndex *ps, const char *path) {
            ps->rope_theta, ps->rms_norm_eps,
            ps->host_layers[0].bq ? "yes" : "no");
     if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE (%d merges)\n", ps->n_bpe_merges);
+    { const char *cs[] = {"raw","chatml","inst","zephyr","phi","gemma"};
+      printf("[doe] chat: %s\n", cs[ps->chat_style < 6 ? ps->chat_style : 0]); }
     printf("[doe] LoRA rank=%d alpha=%.2f experts=%d/layer — parliament is alive.\n",
            ps->lora_rank, ps->lora_alpha, initial_experts);
     #undef PC
@@ -2208,6 +2224,24 @@ static int rune_to_utf8(int r, char *out) {
     out[0] = 0xE0 | (r >> 12); out[1] = 0x80 | ((r >> 6) & 0x3F); out[2] = 0x80 | (r & 0x3F); return 3;
 }
 
+/* Try to match a special token at position i in text. Returns token id and advances *len. */
+static int try_special_token(GGUFIndex *ps, const char *text, int tlen, int i, int *consumed) {
+    static const char *specials[] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|end|>",
+        "<start_of_turn>", "<end_of_turn>", "<|user|>", "<|assistant|>",
+        "[INST]", "[/INST]", "<s>", "</s>", NULL
+    };
+    if (text[i] != '<' && text[i] != '[') return -1;
+    for (int s = 0; specials[s]; s++) {
+        int slen = (int)strlen(specials[s]);
+        if (i + slen <= tlen && memcmp(text + i, specials[s], slen) == 0) {
+            int id = tok_lookup(ps, specials[s], slen);
+            if (id >= 0) { *consumed = slen; return id; }
+        }
+    }
+    return -1;
+}
+
 static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_tokens) {
     if (!ps->vocab_tokens) {
         int n = 0, len = strlen(text);
@@ -2220,46 +2254,68 @@ static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_
     int n = 0;
 
     if (ps->is_gpt2_bpe) {
-        /* GPT-2: each input byte → unicode char → token lookup */
-        for (int i = 0; i < tlen && n < max_tokens; i++) {
+        /* GPT-2: check special tokens first, then byte-level BPE */
+        for (int i = 0; i < tlen && n < max_tokens; ) {
+            int consumed = 0;
+            int sid = try_special_token(ps, text, tlen, i, &consumed);
+            if (sid >= 0) { ids[n++] = sid; i += consumed; continue; }
             int r = gpt2_byte_to_rune((unsigned char)text[i]);
             char u8[4]; int u8len = rune_to_utf8(r, u8);
             int id = tok_lookup(ps, u8, u8len);
             ids[n++] = (id >= 0) ? id : 0;
+            i++;
         }
     } else {
-        /* SentencePiece: prepend space, replace spaces with ▁ */
-        char *sp_text = malloc(tlen * 3 + 4);
-        int sp_len = 0;
-        if (ps->add_space_prefix && tlen > 0 && text[0] != ' ') {
-            sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
-        }
-        for (int i = 0; i < tlen; i++) {
-            if (text[i] == ' ') {
-                sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
-            } else {
-                sp_text[sp_len++] = text[i];
-            }
-        }
-        sp_text[sp_len] = '\0';
-        free(ids); ids = malloc((sp_len + 16) * sizeof(int)); n = 0;
+        /* SentencePiece: split on special tokens first, then ▁-encode segments */
         int i = 0;
-        while (i < sp_len && n < max_tokens) {
-            int clen = 1;
-            unsigned char c = (unsigned char)sp_text[i];
-            if (c >= 0xC0 && c < 0xE0) clen = 2;
-            else if (c >= 0xE0 && c < 0xF0) clen = 3;
-            else if (c >= 0xF0) clen = 4;
-            if (i + clen > sp_len) clen = 1;
-            int id = tok_lookup(ps, sp_text + i, clen);
-            if (id >= 0) { ids[n++] = id; i += clen; }
-            else {
-                char hex[7]; snprintf(hex, 7, "<0x%02X>", (unsigned char)sp_text[i]);
-                id = tok_lookup(ps, hex, 6);
-                ids[n++] = (id >= 0) ? id : 0; i++;
+        while (i < tlen && n < max_tokens) {
+            /* Check special tokens at raw text level */
+            int consumed = 0;
+            int sid = try_special_token(ps, text, tlen, i, &consumed);
+            if (sid >= 0) { ids[n++] = sid; i += consumed; continue; }
+
+            /* Find next special token boundary (or end) */
+            int seg_end = i + 1;
+            while (seg_end < tlen) {
+                int c2 = 0;
+                if (try_special_token(ps, text, tlen, seg_end, &c2) >= 0) break;
+                seg_end++;
             }
+
+            /* Encode segment [i, seg_end) with SentencePiece ▁ */
+            int slen = seg_end - i;
+            char *sp = malloc(slen * 3 + 4);
+            int sp_len = 0;
+            if (ps->add_space_prefix && i == 0 && text[i] != ' ') {
+                sp[sp_len++] = 0xE2; sp[sp_len++] = 0x96; sp[sp_len++] = 0x81;
+            }
+            for (int j = i; j < seg_end; j++) {
+                if (text[j] == ' ') {
+                    sp[sp_len++] = 0xE2; sp[sp_len++] = 0x96; sp[sp_len++] = 0x81;
+                } else {
+                    sp[sp_len++] = text[j];
+                }
+            }
+            sp[sp_len] = '\0';
+            int k = 0;
+            while (k < sp_len && n < max_tokens) {
+                int clen = 1;
+                unsigned char c = (unsigned char)sp[k];
+                if (c >= 0xC0 && c < 0xE0) clen = 2;
+                else if (c >= 0xE0 && c < 0xF0) clen = 3;
+                else if (c >= 0xF0) clen = 4;
+                if (k + clen > sp_len) clen = 1;
+                int id = tok_lookup(ps, sp + k, clen);
+                if (id >= 0) { ids[n++] = id; k += clen; }
+                else {
+                    char hex[7]; snprintf(hex, 7, "<0x%02X>", (unsigned char)sp[k]);
+                    id = tok_lookup(ps, hex, 6);
+                    ids[n++] = (id >= 0) ? id : 0; k++;
+                }
+            }
+            free(sp);
+            i = seg_end;
         }
-        free(sp_text);
     }
 
     n = bpe_merge(ps, ids, n);
@@ -2315,12 +2371,38 @@ static void chat(GGUFIndex *ps) {
         memset(is.key_cache, 0, ps->host_n_layers * max_seq * kd * 4);
         memset(is.value_cache, 0, ps->host_n_layers * max_seq * kd * 4);
 
-        /* Tokenize input */
+        /* Wrap input in chat template (auto-detected from GGUF chat_template) */
+        char wrapped[2048];
+        switch (ps->chat_style) {
+        case 1: /* ChatML (Qwen, SmolLM) */
+            snprintf(wrapped, sizeof(wrapped),
+                "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", input);
+            break;
+        case 2: /* Llama/Mistral [INST] */
+            snprintf(wrapped, sizeof(wrapped), "[INST] %s [/INST]", input);
+            break;
+        case 3: /* Zephyr (TinyLlama) */
+            snprintf(wrapped, sizeof(wrapped),
+                "<|user|>\n%s\n<|assistant|>\n", input);
+            break;
+        case 4: /* Phi */
+            snprintf(wrapped, sizeof(wrapped),
+                "<|user|>\n%s<|end|>\n<|assistant|>\n", input);
+            break;
+        case 5: /* Gemma */
+            snprintf(wrapped, sizeof(wrapped),
+                "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", input);
+            break;
+        default: /* Base models / unknown — raw text */
+            snprintf(wrapped, sizeof(wrapped), "%s", input);
+            break;
+        }
+
+        /* Tokenize wrapped input */
         int input_tokens[512];
         int n_input = 0;
-        /* BOS token */
         if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
-        n_input += tokenize_input(ps, input, input_tokens + n_input, 512 - n_input);
+        n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
 
         int pos = 0;
         for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++)
@@ -2338,6 +2420,16 @@ static void chat(GGUFIndex *ps) {
             apply_field_to_logits(lg, ps->host_vocab);
 
             int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
+
+            /* Stop on EOS or chat-template end tokens */
+            if (next == ps->eos_id) break;
+            if (ps->vocab_tokens && next >= 0 && next < ps->vocab_size && ps->vocab_tokens[next]) {
+                const char *ts = ps->vocab_tokens[next];
+                if (strcmp(ts, "<|im_end|>") == 0 || strcmp(ts, "<|end|>") == 0 ||
+                    strcmp(ts, "<|endoftext|>") == 0 || strcmp(ts, "<end_of_turn>") == 0 ||
+                    strcmp(ts, "<|user|>") == 0)
+                    break;
+            }
 
             /* Prophecy debt — retroactive conscience */
             float pd = compute_prophecy_debt(lg, next, ps->host_vocab);
