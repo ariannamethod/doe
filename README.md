@@ -13,6 +13,7 @@
 > *Inference architecture. Living LoRA parliament. Hebbian plasticity. Physics. Indexes any GGUF read-only. Learns by living.*
 
 ---
+# Democracy of Experts
 
 ## θ = ε + γ + αδ
 
