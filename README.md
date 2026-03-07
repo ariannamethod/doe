@@ -91,11 +91,28 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 
 ```
 --model PATH       GGUF to index (or auto-detect nearby)
+--threads N        CPU threads for matvec (default: all cores)
 --prophecy N       prophecy depth (default 7)
 --destiny F        destiny injection strength (default 0.35)
 --lora-rank N      LoRA rank per expert (default 16)
 --lora-alpha F     injection strength (default 0.1)
 ```
+
+## supported formats
+
+DOE dequantizes at load time — any supported GGUF runs through the same f32 forward pass.
+
+| format | GGML type | status |
+|--------|-----------|--------|
+| F32    | 0         | native (mmap'd) |
+| F16    | 1         | dequant to f32 |
+| Q4_0   | 2         | dequant to f32 |
+| Q5_0   | 6         | dequant to f32 |
+| Q8_0   | 8         | dequant to f32 |
+| Q4_K   | 12        | dequant to f32 |
+| Q6_K   | 14        | dequant to f32 |
+
+tested: Llama, Qwen, Phi, TinyLlama, nanollama architectures.
 
 ---
 
