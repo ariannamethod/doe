@@ -2373,30 +2373,45 @@ static void chat(GGUFIndex *ps) {
 
         /* Wrap input in chat template (auto-detected from GGUF chat_template) */
         char wrapped[2048];
+        /* Only use chat template if the key special tokens exist in vocab */
+        int use_template = 0;
         switch (ps->chat_style) {
-        case 1: /* ChatML (Qwen, SmolLM) */
-            snprintf(wrapped, sizeof(wrapped),
-                "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", input);
+        case 1: /* ChatML */
+            if (tok_lookup(ps, "<|im_start|>", 12) >= 0) {
+                snprintf(wrapped, sizeof(wrapped),
+                    "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", input);
+                use_template = 1;
+            }
             break;
-        case 2: /* Llama/Mistral [INST] */
-            snprintf(wrapped, sizeof(wrapped), "[INST] %s [/INST]", input);
+        case 2: /* [INST] */
+            if (tok_lookup(ps, "[INST]", 6) >= 0) {
+                snprintf(wrapped, sizeof(wrapped), "[INST] %s [/INST]", input);
+                use_template = 1;
+            }
             break;
-        case 3: /* Zephyr (TinyLlama) */
-            snprintf(wrapped, sizeof(wrapped),
-                "<|user|>\n%s\n<|assistant|>\n", input);
+        case 3: /* Zephyr */
+            if (tok_lookup(ps, "<|user|>", 8) >= 0) {
+                snprintf(wrapped, sizeof(wrapped),
+                    "<|user|>\n%s\n<|assistant|>\n", input);
+                use_template = 1;
+            }
             break;
         case 4: /* Phi */
-            snprintf(wrapped, sizeof(wrapped),
-                "<|user|>\n%s<|end|>\n<|assistant|>\n", input);
+            if (tok_lookup(ps, "<|end|>", 7) >= 0) {
+                snprintf(wrapped, sizeof(wrapped),
+                    "<|user|>\n%s<|end|>\n<|assistant|>\n", input);
+                use_template = 1;
+            }
             break;
         case 5: /* Gemma */
-            snprintf(wrapped, sizeof(wrapped),
-                "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", input);
-            break;
-        default: /* Base models / unknown — raw text */
-            snprintf(wrapped, sizeof(wrapped), "%s", input);
+            if (tok_lookup(ps, "<start_of_turn>", 15) >= 0) {
+                snprintf(wrapped, sizeof(wrapped),
+                    "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", input);
+                use_template = 1;
+            }
             break;
         }
+        if (!use_template) snprintf(wrapped, sizeof(wrapped), "%s", input);
 
         /* Tokenize wrapped input */
         int input_tokens[512];
