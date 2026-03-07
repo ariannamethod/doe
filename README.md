@@ -7,14 +7,7 @@
     <circle cx="145" cy="100" r="7" fill="#c25048"/> </svg>
 </p>
 
-```
-  ██████╗  ██████╗ ███████╗
-  ██╔══██╗██╔═══██╗██╔════╝
-  ██║  ██║██║   ██║█████╗
-  ██║  ██║██║   ██║██╔══╝
-  ██████╔╝╚██████╔╝███████╗
-  ╚═════╝  ╚═════╝ ╚══════╝
-```
+
 
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
