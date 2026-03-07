@@ -30,7 +30,7 @@ DOE works in three modes:
 
 - **weightless** — no identity weights. parliament votes over any host GGUF. DOE modulates but doesn't speak.
 - **identity** — `doe_identity*.gguf` found. DOE speaks in its own voice. trained via [nanollama](https://github.com/ariannamethod/nanollama).
-- **symbiont** — identity + external host. DOE wraps a larger model with its own personality and physics.
+- **identity + host** — identity weights + external GGUF indexed together. DOE wraps the host with its own personality and physics.
 
 ## quick start
 
@@ -43,7 +43,7 @@ cc doe.c -O3 -lm -lpthread -o doe
 # with web UI
 ./doe --model path/to/any.gguf --serve 8080
 # open http://localhost:8080       → chat UI
-# open http://localhost:8080/visual → symbiont terminal
+# open http://localhost:8080/visual → parliament terminal
 ```
 
 Drop a `doe_identity*.gguf` into `weights/` and DOE auto-detects it on startup. Largest identity file wins.
@@ -101,11 +101,11 @@ Starts a built-in HTTP server. No dependencies. No Node. No Python.
 | endpoint | what |
 |----------|------|
 | `GET /` | chat UI — clean interface, streaming responses |
-| `GET /visual` | symbiont terminal — particle face, real-time token visualization |
+| `GET /visual` | parliament terminal — particle face, real-time token visualization |
 | `GET /health` | JSON status (model, arch, params, debt, health) |
 | `POST /chat/completions` | SSE token stream — compatible with doe_ui.html |
 
-The visual terminal shows DOE's face assembling from character particles. Prophecy debt controls coherence — high debt = face forms, low debt = galactic chaos. Every token from real inference triggers visual feedback.
+The parliament terminal shows DOE's face assembling from character particles. Prophecy debt controls coherence — high debt = face forms, low debt = galactic chaos. Every token from real inference triggers visual feedback.
 
 ---
 

@@ -897,6 +897,151 @@ static void test_notorch_zero_signal(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * JSON utility tests (--serve mode)
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_json_escape_basic(void) {
+    TEST(json_escape_basic);
+    char buf[64];
+    json_escape("hello world", buf, sizeof(buf));
+    ASSERT_TRUE(strcmp(buf, "hello world") == 0, "plain text unchanged");
+    PASS();
+}
+
+static void test_json_escape_special_chars(void) {
+    TEST(json_escape_special_chars);
+    char buf[64];
+    json_escape("he said \"hi\"\nand\\left", buf, sizeof(buf));
+    ASSERT_TRUE(strstr(buf, "\\\"") != NULL, "quotes should be escaped");
+    ASSERT_TRUE(strstr(buf, "\\n") != NULL, "newline should be escaped");
+    ASSERT_TRUE(strstr(buf, "\\\\") != NULL, "backslash should be escaped");
+    PASS();
+}
+
+static void test_json_escape_tabs_cr(void) {
+    TEST(json_escape_tabs_cr);
+    char buf[64];
+    json_escape("a\tb\rc", buf, sizeof(buf));
+    ASSERT_TRUE(strstr(buf, "\\t") != NULL, "tab should be escaped");
+    ASSERT_TRUE(strstr(buf, "\\r") != NULL, "CR should be escaped");
+    PASS();
+}
+
+static void test_json_escape_empty(void) {
+    TEST(json_escape_empty);
+    char buf[16];
+    int n = json_escape("", buf, sizeof(buf));
+    ASSERT_TRUE(n == 0, "empty string → length 0");
+    ASSERT_TRUE(buf[0] == '\0', "empty string → null terminated");
+    PASS();
+}
+
+static void test_json_escape_truncation(void) {
+    TEST(json_escape_truncation);
+    char buf[8];
+    json_escape("abcdefghijklmnop", buf, sizeof(buf));
+    ASSERT_TRUE(strlen(buf) < 8, "output should fit in buffer");
+    ASSERT_TRUE(buf[strlen(buf)] == '\0', "must be null-terminated");
+    PASS();
+}
+
+static void test_json_get_string_basic(void) {
+    TEST(json_get_string_basic);
+    char out[64];
+    const char *json = "{\"name\": \"DOE\", \"version\": \"1.0\"}";
+    int n = json_get_string(json, "name", out, sizeof(out));
+    ASSERT_TRUE(n > 0, "should find key");
+    ASSERT_TRUE(strcmp(out, "DOE") == 0, "should extract value");
+    PASS();
+}
+
+static void test_json_get_string_missing(void) {
+    TEST(json_get_string_missing_key);
+    char out[64];
+    const char *json = "{\"name\": \"DOE\"}";
+    int n = json_get_string(json, "missing", out, sizeof(out));
+    ASSERT_TRUE(n == 0, "missing key should return 0");
+    PASS();
+}
+
+static void test_json_get_string_escaped(void) {
+    TEST(json_get_string_with_escapes);
+    char out[64];
+    const char *json = "{\"msg\": \"hello\\nworld\"}";
+    int n = json_get_string(json, "msg", out, sizeof(out));
+    ASSERT_TRUE(n > 0, "should find key");
+    /* json_get_string skips the backslash, keeps the char after */
+    ASSERT_TRUE(strchr(out, 'n') != NULL, "should contain the escaped char");
+    PASS();
+}
+
+static void test_json_get_float_basic(void) {
+    TEST(json_get_float_basic);
+    const char *json = "{\"temperature\": 0.75, \"top_k\": 50}";
+    float t = json_get_float(json, "temperature", 1.0f);
+    ASSERT_FLOAT_EQ(t, 0.75f, 0.01f, "should extract 0.75");
+    float k = json_get_float(json, "top_k", 0.0f);
+    ASSERT_FLOAT_EQ(k, 50.0f, 0.1f, "should extract 50");
+    PASS();
+}
+
+static void test_json_get_float_missing(void) {
+    TEST(json_get_float_missing);
+    const char *json = "{\"temperature\": 0.5}";
+    float v = json_get_float(json, "absent", 42.0f);
+    ASSERT_FLOAT_EQ(v, 42.0f, 1e-5f, "missing key should return default");
+    PASS();
+}
+
+static void test_json_get_last_user_message_single(void) {
+    TEST(json_get_last_user_message_single);
+    char out[256];
+    const char *body =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"What is DOE?\"}]}";
+    int n = json_get_last_user_message(body, out, sizeof(out));
+    ASSERT_TRUE(n > 0, "should find user message");
+    ASSERT_TRUE(strcmp(out, "What is DOE?") == 0, "should extract content");
+    PASS();
+}
+
+static void test_json_get_last_user_message_multi(void) {
+    TEST(json_get_last_user_message_multi);
+    char out[256];
+    const char *body =
+        "{\"messages\":["
+        "{\"role\":\"user\",\"content\":\"first\"},"
+        "{\"role\":\"assistant\",\"content\":\"reply\"},"
+        "{\"role\":\"user\",\"content\":\"second\"}"
+        "]}";
+    int n = json_get_last_user_message(body, out, sizeof(out));
+    ASSERT_TRUE(n > 0, "should find message");
+    ASSERT_TRUE(strcmp(out, "second") == 0, "should extract LAST user message");
+    PASS();
+}
+
+static void test_json_get_last_user_message_none(void) {
+    TEST(json_get_last_user_message_no_user);
+    char out[256];
+    const char *body =
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hello\"}]}";
+    int n = json_get_last_user_message(body, out, sizeof(out));
+    ASSERT_TRUE(n == 0, "no user messages should return 0");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * mycelium spore path tests
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_spore_path_format(void) {
+    TEST(spore_path_format);
+    char path[256];
+    snprintf(path, sizeof(path), "doe_mycelium/spore_%016llx_s%d.bin",
+             (unsigned long long)0xDEADBEEF, 200);
+    ASSERT_TRUE(strstr(path, "doe_mycelium/spore_") != NULL, "should have prefix");
+    ASSERT_TRUE(strstr(path, "_s200.bin") != NULL, "should have step suffix");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * MAIN — run all tests
  * ═══════════════════════════════════════════════════════════════════ */
 int main(void) {
@@ -1011,6 +1156,26 @@ int main(void) {
     /* NOTORCH */
     printf("\n[notorch]\n");
     test_notorch_zero_signal();
+
+    /* JSON / serve utilities */
+    printf("\n[json]\n");
+    test_json_escape_basic();
+    test_json_escape_special_chars();
+    test_json_escape_tabs_cr();
+    test_json_escape_empty();
+    test_json_escape_truncation();
+    test_json_get_string_basic();
+    test_json_get_string_missing();
+    test_json_get_string_escaped();
+    test_json_get_float_basic();
+    test_json_get_float_missing();
+    test_json_get_last_user_message_single();
+    test_json_get_last_user_message_multi();
+    test_json_get_last_user_message_none();
+
+    /* Mycelium */
+    printf("\n[mycelium]\n");
+    test_spore_path_format();
 
     /* Summary */
     printf("\n═══════════════════════════════════════════════════════\n");

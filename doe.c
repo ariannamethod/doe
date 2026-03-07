@@ -961,7 +961,7 @@ typedef struct {
 } FieldLayer;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SYMBIONT STATE — the full host-DOE interface.
+ * INDEX STATE — the full host-DOE interface.
  * mmap'd host model + DOE's living LoRA overlay + weight profile.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
@@ -1905,7 +1905,7 @@ static int mycelium_load(GGUFIndex *ps, uint64_t target_fp) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * SYMBIONT FORWARD — run token through host with DOE modulation.
+ * INDEX FORWARD — run token through host with DOE modulation.
  *
  * per layer:
  *   1. host attention (read-only weights, KV cache)
@@ -2843,7 +2843,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
 
     printf("[serve] parliament listening on http://0.0.0.0:%d\n", g_serve_port);
     printf("[serve]   /         → chat UI\n");
-    printf("[serve]   /visual   → symbiont terminal\n");
+    printf("[serve]   /visual   → parliament terminal\n");
     printf("[serve]   /health   → status\n");
     printf("[serve]   POST /chat/completions → inference stream\n\n");
 
