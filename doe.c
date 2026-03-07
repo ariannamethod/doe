@@ -1306,8 +1306,14 @@ static int index_load(GGUFIndex *ps, const char *path) {
     }
     free(tinfo);
 
+    /* tied embeddings: if output.weight missing, reuse token_embd.weight */
+    if (!ps->host_output && ps->host_tok_emb) {
+        ps->host_output = ps->host_tok_emb;
+        printf("[doe] output.weight missing — using tied embeddings\n");
+    }
     if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
-        printf("[doe] host missing essential weights. abandoning.\n");
+        printf("[doe] host missing essential weights (tok_emb=%d out=%d norm=%d). abandoning.\n",
+               ps->host_tok_emb!=NULL, ps->host_output!=NULL, ps->host_norm!=NULL);
         goto bail;
     }
 
