@@ -1018,6 +1018,12 @@ typedef struct {
 
     /* Chat template detection */
     int     chat_style;     /* 0=raw, 1=chatml, 2=llama/mistral [INST], 3=zephyr, 4=phi, 5=gemma */
+
+    /* Identity & gamma */
+    int     weightless;     /* 1 if no doe_identity.gguf found */
+    char    identity_tag[128]; /* doe.identity metadata from GGUF — empty if not DOE's own */
+    void   *gamma_data;     /* raw gamma binary blob */
+    int     gamma_size;     /* gamma blob size in bytes */
 } GGUFIndex;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
@@ -1190,6 +1196,11 @@ static int index_load(GGUFIndex *ps, const char *path) {
             if (strstr(key, "tokenizer.ggml.model") && vlen < 20) {
                 char tok_model[24]; memcpy(tok_model, p, vlen); tok_model[vlen] = 0;
                 if (strcmp(tok_model, "gpt2") == 0) ps->is_gpt2_bpe = 1;
+            }
+            /* DOE identity fingerprint — this GGUF is DOE's own */
+            if (strcmp(key, "doe.identity") == 0 && vlen < 128) {
+                memcpy(ps->identity_tag, p, vlen); ps->identity_tag[vlen] = 0;
+                printf("[identity] GGUF self-identifies: \"%s\"\n", ps->identity_tag);
             }
             /* Detect chat template style from template string */
             if (strstr(key, "chat_template") && vlen > 10 && vlen < 100000) {
@@ -2574,20 +2585,65 @@ int main(int argc, char **argv) {
     Environment env;
     env_scan(&env, __FILE__);
 
-    /* ── Find host GGUF ── */
-    if (gguf_path[0] == '\0') {
-        /* Auto-detect: pick first non-mycelium GGUF — size doesn't matter */
-        int best = -1;
-        for (int i = 0; i < env.n_ggufs; i++) {
-            if (strstr(env.ggufs[i].path, "mycelium/")) continue;
-            best = i; break;
+    /* ── PHASE 1: Search for DOE identity + gamma FIRST ── */
+    char identity_path[256] = "";
+    char gamma_path[256] = "";
+    int weightless = 1;
+    {
+        static const char *wdirs[] = { "weights/", "doe_w/", "./", "../weights/", NULL };
+        struct stat st;
+        for (int d = 0; wdirs[d] && identity_path[0] == '\0'; d++) {
+            char tmp[256];
+            snprintf(tmp, 256, "%sdoe_identity.gguf", wdirs[d]);
+            if (stat(tmp, &st) == 0 && st.st_size > 0) {
+                snprintf(identity_path, 256, "%s", tmp);
+                printf("[identity] found: %s (%.1fMB)\n", tmp, (float)st.st_size/(1024*1024));
+                weightless = 0;
+            }
         }
-        if (best >= 0) {
-            snprintf(gguf_path, 256, "%s", env.ggufs[best].path);
-            printf("[auto] indexing: %s (%.1fMB)\n", gguf_path, (float)env.ggufs[best].file_size/(1024*1024));
+        for (int d = 0; wdirs[d] && gamma_path[0] == '\0'; d++) {
+            char tmp[256];
+            snprintf(tmp, 256, "%sdoe_gamma.bin", wdirs[d]);
+            if (stat(tmp, &st) == 0 && st.st_size > 0) {
+                snprintf(gamma_path, 256, "%s", tmp);
+                printf("[gamma] found: %s (%.1fMB)\n", tmp, (float)st.st_size/(1024*1024));
+            }
+        }
+        if (weightless)
+            printf("[identity] no doe_identity.gguf — weightless mode.\n");
+        if (gamma_path[0] == '\0')
+            printf("[gamma] no doe_gamma.bin — parliament self-organizes.\n");
+    }
+
+    /* ── PHASE 2: Find host GGUF (external knowledge substrate) ── */
+    if (gguf_path[0] == '\0') {
+        if (identity_path[0] != '\0') {
+            snprintf(gguf_path, 256, "%s", identity_path);
+            printf("[host] using identity as host model.\n");
         } else {
-            fprintf(stderr, "[error] no GGUF found. use --model PATH or place a .gguf nearby.\n");
-            return 1;
+            /* Also check all discovered GGUFs for doe.identity metadata */
+            int identity_idx = -1, external_idx = -1;
+            for (int i = 0; i < env.n_ggufs; i++) {
+                if (strstr(env.ggufs[i].path, "mycelium/")) continue;
+                if (strstr(env.ggufs[i].path, "doe_gamma")) continue;
+                /* Quick sniff for doe.identity key in this GGUF */
+                if (strstr(env.ggufs[i].path, "doe_identity")) {
+                    identity_idx = i; continue;
+                }
+                if (external_idx < 0) external_idx = i;
+            }
+            /* Identity GGUF by name takes priority */
+            if (identity_idx >= 0) {
+                snprintf(gguf_path, 256, "%s", env.ggufs[identity_idx].path);
+                printf("[host] found identity GGUF: %s\n", gguf_path);
+                weightless = 0;
+            } else if (external_idx >= 0) {
+                snprintf(gguf_path, 256, "%s", env.ggufs[external_idx].path);
+                printf("[host] indexing external: %s (%.1fMB)\n", gguf_path, (float)env.ggufs[external_idx].file_size/(1024*1024));
+            } else {
+                fprintf(stderr, "[error] no GGUF found. use --model PATH or place a .gguf nearby.\n");
+                return 1;
+            }
         }
     }
 
@@ -2596,6 +2652,27 @@ int main(int argc, char **argv) {
     if (!index_load(&idx, gguf_path)) {
         fprintf(stderr, "[error] failed to index %s\n", gguf_path);
         return 1;
+    }
+    idx.weightless = weightless;
+
+    /* If GGUF has doe.identity metadata — it's ours regardless of filename */
+    if (idx.identity_tag[0] != '\0') {
+        idx.weightless = 0;
+        printf("[identity] verified via metadata: \"%s\"\n", idx.identity_tag);
+    }
+
+    /* ── Load gamma if found ── */
+    if (gamma_path[0] != '\0') {
+        FILE *gf = fopen(gamma_path, "rb");
+        if (gf) {
+            fseek(gf, 0, SEEK_END); long gsz = ftell(gf); fseek(gf, 0, SEEK_SET);
+            idx.gamma_data = malloc(gsz);
+            idx.gamma_size = (int)gsz;
+            if (fread(idx.gamma_data, 1, gsz, gf) == (size_t)gsz)
+                printf("[gamma] loaded %ld bytes — personality active.\n", gsz);
+            else { free(idx.gamma_data); idx.gamma_data = NULL; idx.gamma_size = 0; }
+            fclose(gf);
+        }
     }
 
     /* ── Mycelium — check for existing LoRA spores ── */
