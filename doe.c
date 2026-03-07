@@ -972,8 +972,11 @@ typedef struct {
     float *host_tok_emb;
     float *host_output;
     float *host_norm;
+    float    rope_theta;     /* RoPE frequency base (default 10000, Qwen=1000000) */
+    float    rms_norm_eps;   /* RMSNorm epsilon (default 1e-5, varies per arch) */
     struct {
         float *wq, *wk, *wv, *wo;
+        float *bq, *bk, *bv;   /* attention biases (Qwen2, optional) */
         float *ffn_gate, *ffn_up, *ffn_down;
         float *attn_norm, *ffn_norm;
     } host_layers[MAX_LAYERS];
@@ -998,10 +1001,19 @@ typedef struct {
 
     /* Tokenizer from GGUF metadata */
     char  **vocab_tokens;   /* token strings, indexed by token id */
-    float  *vocab_scores;   /* BPE merge scores per token */
+    float  *vocab_scores;   /* BPE merge scores per token (SentencePiece) or from merges (GPT-2) */
     int     vocab_size;     /* number of entries */
     int     bos_id, eos_id; /* special tokens */
     int     add_space_prefix;
+    int     is_gpt2_bpe;    /* 1 if tokenizer.ggml.model == "gpt2" */
+
+    /* GPT-2 BPE merges (used to build scores if no native scores) */
+    char  **bpe_merges;     /* merge strings "A B" */
+    int     n_bpe_merges;
+
+    /* Token hash table for O(1) lookup */
+    int    *tok_ht_ids;     /* hash table: token id or -1 */
+    int     tok_ht_cap;     /* hash table capacity (power of 2) */
 } GGUFIndex;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
@@ -1130,12 +1142,18 @@ static void free_lora_expert(LoraExpert *e) {
     e->alive = 0; e->vitality = 0;
 }
 
+static int tok_lookup(GGUFIndex *ps, const char *s, int len);
+static void tok_ht_build(GGUFIndex *ps);
+static void build_gpt2_scores(GGUFIndex *ps);
+
 static int index_load(GGUFIndex *ps, const char *path) {
     memset(ps, 0, sizeof(GGUFIndex));
     snprintf(ps->host_path, 256, "%s", path);
     ps->lora_rank = LORA_RANK;
     ps->lora_alpha = F.lora_alpha;
     ps->bos_id = 1; ps->eos_id = 2; /* defaults, overridden by GGUF */
+    ps->rope_theta = 10000.0f;
+    ps->rms_norm_eps = 1e-5f;
     ps->add_space_prefix = 1;
 
     int fd = open(path, O_RDONLY);
@@ -1165,6 +1183,10 @@ static int index_load(GGUFIndex *ps, const char *path) {
             if (strstr(key, "general.architecture") && vlen < 64) {
                 memcpy(ps->host_arch, p, vlen); ps->host_arch[vlen] = 0;
             }
+            if (strstr(key, "tokenizer.ggml.model") && vlen < 20) {
+                char tok_model[24]; memcpy(tok_model, p, vlen); tok_model[vlen] = 0;
+                if (strcmp(tok_model, "gpt2") == 0) ps->is_gpt2_bpe = 1;
+            }
             p += vlen;
         } else if (vtype == 4) { /* uint32 */
             PC(4); uint32_t val = *(uint32_t*)p; p += 4;
@@ -1177,12 +1199,16 @@ static int index_load(GGUFIndex *ps, const char *path) {
             else if (strstr(key, "bos_token_id")) ps->bos_id = (int)val;
             else if (strstr(key, "eos_token_id")) ps->eos_id = (int)val;
             else if (strstr(key, "add_space_prefix")) ps->add_space_prefix = (int)val;
+        } else if (vtype == 6) { /* float32 */
+            PC(4); float fval; memcpy(&fval, p, 4); p += 4;
+            if (strstr(key, "rope.freq_base")) ps->rope_theta = fval;
+            else if (strstr(key, "layer_norm_rms_epsilon")) ps->rms_norm_eps = fval;
         } else if (vtype == 0 || vtype == 7) {
             PC(1); uint8_t bval = *p; p += 1;
             if (strstr(key, "add_space_prefix")) ps->add_space_prefix = bval;
         } else if (vtype == 1) p += 1;                            /* int8 */
         else if (vtype == 2 || vtype == 3) p += 2;             /* uint16, int16 */
-        else if (vtype == 5 || vtype == 6) p += 4;             /* int32, float32 */
+        else if (vtype == 5) p += 4;                            /* int32 */
         else if (vtype == 10 || vtype == 11 || vtype == 12) p += 8; /* uint64, int64, float64 */
         else if (vtype == 9) { /* array */
             PC(4); uint32_t atype = *(uint32_t*)p; p += 4;
@@ -1202,16 +1228,27 @@ static int index_load(GGUFIndex *ps, const char *path) {
             else if (atype == 8) {
                 /* array of strings */
                 int is_vocab = strstr(key, "tokenizer.ggml.tokens") != NULL;
+                int is_merges = strstr(key, "tokenizer.ggml.merges") != NULL;
                 if (is_vocab && alen < 200000) {
                     ps->vocab_tokens = calloc(alen, sizeof(char*));
                     ps->vocab_size = (int)alen;
                 }
+                if (is_merges && alen < 500000) {
+                    ps->bpe_merges = calloc(alen, sizeof(char*));
+                    ps->n_bpe_merges = (int)alen;
+                }
                 for (uint64_t ai = 0; ai < alen && p < pend; ai++) {
                     PC(8); uint64_t slen = *(uint64_t*)p; p += 8;
+                    if (slen > 1000000 || p + slen > pend) break; /* sanity */
                     if (is_vocab && ps->vocab_tokens && ai < (uint64_t)ps->vocab_size) {
                         ps->vocab_tokens[ai] = malloc(slen + 1);
                         memcpy(ps->vocab_tokens[ai], p, slen);
                         ps->vocab_tokens[ai][slen] = '\0';
+                    }
+                    if (is_merges && ps->bpe_merges && ai < (uint64_t)ps->n_bpe_merges) {
+                        ps->bpe_merges[ai] = malloc(slen + 1);
+                        memcpy(ps->bpe_merges[ai], p, slen);
+                        ps->bpe_merges[ai][slen] = '\0';
                     }
                     p += slen;
                 }
@@ -1296,6 +1333,9 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 else if (strstr(n, "attn_k.weight")) { ps->host_layers[l].wk = data; wired++; }
                 else if (strstr(n, "attn_v.weight")) { ps->host_layers[l].wv = data; wired++; }
                 else if (strstr(n, "attn_output.weight")) { ps->host_layers[l].wo = data; wired++; }
+                else if (strstr(n, "attn_q.bias")) { ps->host_layers[l].bq = data; wired++; }
+                else if (strstr(n, "attn_k.bias")) { ps->host_layers[l].bk = data; wired++; }
+                else if (strstr(n, "attn_v.bias")) { ps->host_layers[l].bv = data; wired++; }
                 else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp")) { ps->host_layers[l].ffn_gate = data; wired++; }
                 else if (strstr(n, "ffn_up.weight")) { ps->host_layers[l].ffn_up = data; wired++; }
                 else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; wired++; }
@@ -1385,9 +1425,16 @@ static int index_load(GGUFIndex *ps, const char *path) {
     }
 
     ps->active = 1;
-    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d vocab=%d %.1fMB)\n",
+    /* Build token hash table for O(1) lookup, then GPT-2 BPE scores */
+    tok_ht_build(ps);
+    build_gpt2_scores(ps);
+    printf("[doe] attached to %s (arch=%s dim=%d layers=%d heads=%d kv=%d vocab=%d %.1fMB)\n",
            path, ps->host_arch, ps->host_dim, ps->host_n_layers, ps->host_heads,
-           ps->host_vocab, (float)ps->mmap_size/(1024*1024));
+           ps->host_kv_heads, ps->host_vocab, (float)ps->mmap_size/(1024*1024));
+    printf("[doe] rope_theta=%.0f rms_eps=%.1e bias=%s\n",
+           ps->rope_theta, ps->rms_norm_eps,
+           ps->host_layers[0].bq ? "yes" : "no");
+    if (ps->is_gpt2_bpe) printf("[doe] tokenizer: GPT-2 BPE (%d merges)\n", ps->n_bpe_merges);
     printf("[doe] LoRA rank=%d alpha=%.2f experts=%d/layer — parliament is alive.\n",
            ps->lora_rank, ps->lora_alpha, initial_experts);
     #undef PC
@@ -1414,6 +1461,10 @@ static void index_free(GGUFIndex *ps) {
         free(ps->vocab_tokens);
     }
     free(ps->vocab_scores);
+    if (ps->bpe_merges) {
+        for (int i = 0; i < ps->n_bpe_merges; i++) free(ps->bpe_merges[i]);
+        free(ps->bpe_merges);
+    }
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
     memset(ps, 0, sizeof(GGUFIndex));
 }
@@ -1847,7 +1898,7 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     int half = ps->host_head_dim / 2;
     s.cos_cache = calloc(max_seq * half, 4);
     s.sin_cache = calloc(max_seq * half, 4);
-    float rope_theta = 10000.0f;
+    float rope_theta = ps->rope_theta;
     for (int p = 0; p < max_seq; p++)
         for (int i = 0; i < half; i++) {
             float freq = 1.0f / powf(rope_theta, (float)(2*i) / (float)ps->host_head_dim);
@@ -1886,12 +1937,17 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 
         /* ── Host attention ── */
         float *xn = s->xb;
-        if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, 1e-5f);
+        if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
         else memcpy(xn, s->x, D*4);
 
         matvec(s->q, ps->host_layers[l].wq, xn, ps->host_heads*hd, D);
         matvec(s->k, ps->host_layers[l].wk, xn, kd, D);
         matvec(s->v, ps->host_layers[l].wv, xn, kd, D);
+
+        /* Add attention biases (Qwen2, optional) */
+        if (ps->host_layers[l].bq) for (int i = 0; i < ps->host_heads*hd; i++) s->q[i] += ps->host_layers[l].bq[i];
+        if (ps->host_layers[l].bk) for (int i = 0; i < kd; i++) s->k[i] += ps->host_layers[l].bk[i];
+        if (ps->host_layers[l].bv) for (int i = 0; i < kd; i++) s->v[i] += ps->host_layers[l].bv[i];
 
         for (int h = 0; h < ps->host_heads; h++) apply_rope(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd);
         for (int h = 0; h < ps->host_kv_heads; h++) apply_rope(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd);
@@ -1947,7 +2003,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         /* ── Host FFN (SwiGLU) ── */
         if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
             float *fn = s->xb;
-            if (ps->host_layers[l].ffn_norm) rmsnorm(fn, s->x, ps->host_layers[l].ffn_norm, D, 1e-5f);
+            if (ps->host_layers[l].ffn_norm) rmsnorm(fn, s->x, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
             else memcpy(fn, s->x, D*4);
             matvec(s->hb, ps->host_layers[l].ffn_gate, fn, H, D);
             matvec(s->hb2, ps->host_layers[l].ffn_up, fn, H, D);
@@ -1958,7 +2014,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
     }
 
     /* Final norm + LM head */
-    rmsnorm(s->x, s->x, ps->host_norm, D, 1e-5f);
+    rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
     matvec(s->logits, ps->host_output, s->x, ps->host_vocab, D);
 
     return s->logits;
@@ -1986,6 +2042,16 @@ static int sample(float *logits, int V, float temp, int top_k) {
 static void token_decode_print(GGUFIndex *ps, int token) {
     if (ps->vocab_tokens && token >= 0 && token < ps->vocab_size && ps->vocab_tokens[token]) {
         const char *s = ps->vocab_tokens[token];
+        if (ps->is_gpt2_bpe) {
+            /* GPT-2 byte-level BPE: Ġ (0xC4 0xA0) = space, Ċ (0xC4 0x8A) = newline */
+            while (*s) {
+                if ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0xA0) {
+                    fputc(' ', stdout); s += 2;
+                } else if ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0x8A) {
+                    fputc('\n', stdout); s += 2;
+                } else { fputc(*s, stdout); s++; }
+            }
+        } else {
         /* Handle sentencepiece ▁ (U+2581, 3 bytes: E2 96 81) → space */
         while (*s) {
             if ((unsigned char)s[0] == 0xE2 && (unsigned char)s[1] == 0x96 && (unsigned char)s[2] == 0x81) {
@@ -2002,6 +2068,7 @@ static void token_decode_print(GGUFIndex *ps, int token) {
                 s++;
             }
         }
+        }
     } else if (token >= 0 && token < 256) {
         char c = (char)token;
         if (c >= 32 || c == '\n' || c == '\t') fputc(c, stdout);
@@ -2010,12 +2077,73 @@ static void token_decode_print(GGUFIndex *ps, int token) {
 
 /* ── BPE Tokenizer — SentencePiece style, score-based merge ── */
 
-/* Find token ID by string. Returns -1 if not found. */
-static int tok_lookup(GGUFIndex *ps, const char *s, int len) {
+static int tok_lookup(GGUFIndex *ps, const char *s, int len); /* forward decl */
+
+/* Build GPT-2 BPE scores from merges (called after index_load if needed) */
+static void build_gpt2_scores(GGUFIndex *ps) {
+    if (!ps->is_gpt2_bpe || !ps->bpe_merges || ps->n_bpe_merges == 0 || ps->vocab_scores || !ps->vocab_tokens) return;
+    ps->vocab_scores = calloc(ps->vocab_size, sizeof(float));
+    for (int i = 0; i < ps->vocab_size; i++) ps->vocab_scores[i] = -1e9f;
+    int built = 0;
+    for (int m = 0; m < ps->n_bpe_merges; m++) {
+        const char *merge = ps->bpe_merges[m];
+        const char *sp = strchr(merge, ' ');
+        if (!sp) continue;
+        int la = (int)(sp - merge), lb = (int)strlen(sp + 1);
+        if (la + lb > 128) continue;
+        char merged[130];
+        memcpy(merged, merge, la);
+        memcpy(merged + la, sp + 1, lb);
+        int mid = tok_lookup(ps, merged, la + lb);
+        if (mid >= 0) { ps->vocab_scores[mid] = (float)(ps->n_bpe_merges - m); built++; }
+    }
+    printf("[doe] GPT-2 BPE: built %d merge scores from %d merges\n", built, ps->n_bpe_merges);
+    ps->add_space_prefix = 0;
+}
+
+/* FNV-1a hash */
+static uint32_t tok_hash(const char *s, int len) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) { h ^= (uint8_t)s[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Build hash table for O(1) token lookup */
+static void tok_ht_build(GGUFIndex *ps) {
+    if (!ps->vocab_tokens || ps->vocab_size == 0) return;
+    int cap = 1;
+    while (cap < ps->vocab_size * 3) cap <<= 1; /* ~33% load factor */
+    ps->tok_ht_ids = malloc(cap * sizeof(int));
+    ps->tok_ht_cap = cap;
+    for (int i = 0; i < cap; i++) ps->tok_ht_ids[i] = -1;
+    int mask = cap - 1;
     for (int i = 0; i < ps->vocab_size; i++) {
-        if (ps->vocab_tokens[i] && strlen(ps->vocab_tokens[i]) == (size_t)len
-            && memcmp(ps->vocab_tokens[i], s, len) == 0)
-            return i;
+        if (!ps->vocab_tokens[i]) continue;
+        int slen = (int)strlen(ps->vocab_tokens[i]);
+        uint32_t idx = tok_hash(ps->vocab_tokens[i], slen) & mask;
+        while (ps->tok_ht_ids[idx] != -1) idx = (idx + 1) & mask;
+        ps->tok_ht_ids[idx] = i;
+    }
+}
+
+/* Find token ID by string. Returns -1 if not found. O(1) average. */
+static int tok_lookup(GGUFIndex *ps, const char *s, int len) {
+    if (!ps->tok_ht_ids) {
+        /* fallback linear scan */
+        for (int i = 0; i < ps->vocab_size; i++) {
+            if (ps->vocab_tokens[i] && strlen(ps->vocab_tokens[i]) == (size_t)len
+                && memcmp(ps->vocab_tokens[i], s, len) == 0)
+                return i;
+        }
+        return -1;
+    }
+    int mask = ps->tok_ht_cap - 1;
+    uint32_t idx = tok_hash(s, len) & mask;
+    while (ps->tok_ht_ids[idx] != -1) {
+        int id = ps->tok_ht_ids[idx];
+        const char *t = ps->vocab_tokens[id];
+        if (t && strlen(t) == (size_t)len && memcmp(t, s, len) == 0) return id;
+        idx = (idx + 1) & mask;
     }
     return -1;
 }
@@ -2052,65 +2180,92 @@ static int bpe_merge(GGUFIndex *ps, int *ids, int n) {
     return n;
 }
 
+/* GPT-2 byte-to-unicode table: maps each byte to a unicode codepoint */
+static int gpt2_byte_to_rune(int b) {
+    /* Printable ASCII + Latin-1 supplement range → identity */
+    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))
+        return b;
+    /* Everything else → 256 + offset */
+    static int table_built = 0;
+    static int table[256];
+    if (!table_built) {
+        int n = 0;
+        for (int i = 0; i < 256; i++) {
+            if ((i >= 33 && i <= 126) || (i >= 161 && i <= 172) || (i >= 174 && i <= 255))
+                table[i] = i;
+            else
+                table[i] = 256 + n++;
+        }
+        table_built = 1;
+    }
+    return table[(unsigned char)b];
+}
+
+/* Encode a unicode codepoint as UTF-8, return length */
+static int rune_to_utf8(int r, char *out) {
+    if (r < 0x80) { out[0] = (char)r; return 1; }
+    if (r < 0x800) { out[0] = 0xC0 | (r >> 6); out[1] = 0x80 | (r & 0x3F); return 2; }
+    out[0] = 0xE0 | (r >> 12); out[1] = 0x80 | ((r >> 6) & 0x3F); out[2] = 0x80 | (r & 0x3F); return 3;
+}
+
 static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_tokens) {
     if (!ps->vocab_tokens) {
-        /* No vocab — byte-level fallback */
         int n = 0, len = strlen(text);
         for (int i = 0; i < len && n < max_tokens; i++) tokens[n++] = (unsigned char)text[i];
         return n;
     }
 
-    /* Prepend space (SentencePiece convention) and replace spaces with ▁ (U+2581) */
     int tlen = strlen(text);
-    /* Worst case: each char becomes 3 bytes (▁) + space prefix */
-    char *sp_text = malloc(tlen * 3 + 4);
-    int sp_len = 0;
-    if (ps->add_space_prefix && tlen > 0 && text[0] != ' ') {
-        sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81; /* ▁ */
-    }
-    for (int i = 0; i < tlen; i++) {
-        if (text[i] == ' ') {
-            sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
-        } else {
-            sp_text[sp_len++] = text[i];
-        }
-    }
-    sp_text[sp_len] = '\0';
-
-    /* Initial tokenization: each UTF-8 character or byte-fallback */
-    int *ids = malloc(sp_len * sizeof(int));
+    int *ids = malloc((tlen + 16) * sizeof(int));
     int n = 0;
-    int i = 0;
-    while (i < sp_len && n < max_tokens) {
-        /* Try single UTF-8 character */
-        int clen = 1;
-        unsigned char c = (unsigned char)sp_text[i];
-        if (c >= 0xC0 && c < 0xE0) clen = 2;
-        else if (c >= 0xE0 && c < 0xF0) clen = 3;
-        else if (c >= 0xF0) clen = 4;
-        if (i + clen > sp_len) clen = 1;
 
-        int id = tok_lookup(ps, sp_text + i, clen);
-        if (id >= 0) {
-            ids[n++] = id;
-            i += clen;
-        } else {
-            /* Byte fallback: <0xNN> */
-            char hex[7];
-            snprintf(hex, 7, "<0x%02X>", (unsigned char)sp_text[i]);
-            id = tok_lookup(ps, hex, 6);
+    if (ps->is_gpt2_bpe) {
+        /* GPT-2: each input byte → unicode char → token lookup */
+        for (int i = 0; i < tlen && n < max_tokens; i++) {
+            int r = gpt2_byte_to_rune((unsigned char)text[i]);
+            char u8[4]; int u8len = rune_to_utf8(r, u8);
+            int id = tok_lookup(ps, u8, u8len);
             ids[n++] = (id >= 0) ? id : 0;
-            i++;
         }
+    } else {
+        /* SentencePiece: prepend space, replace spaces with ▁ */
+        char *sp_text = malloc(tlen * 3 + 4);
+        int sp_len = 0;
+        if (ps->add_space_prefix && tlen > 0 && text[0] != ' ') {
+            sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
+        }
+        for (int i = 0; i < tlen; i++) {
+            if (text[i] == ' ') {
+                sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
+            } else {
+                sp_text[sp_len++] = text[i];
+            }
+        }
+        sp_text[sp_len] = '\0';
+        free(ids); ids = malloc((sp_len + 16) * sizeof(int)); n = 0;
+        int i = 0;
+        while (i < sp_len && n < max_tokens) {
+            int clen = 1;
+            unsigned char c = (unsigned char)sp_text[i];
+            if (c >= 0xC0 && c < 0xE0) clen = 2;
+            else if (c >= 0xE0 && c < 0xF0) clen = 3;
+            else if (c >= 0xF0) clen = 4;
+            if (i + clen > sp_len) clen = 1;
+            int id = tok_lookup(ps, sp_text + i, clen);
+            if (id >= 0) { ids[n++] = id; i += clen; }
+            else {
+                char hex[7]; snprintf(hex, 7, "<0x%02X>", (unsigned char)sp_text[i]);
+                id = tok_lookup(ps, hex, 6);
+                ids[n++] = (id >= 0) ? id : 0; i++;
+            }
+        }
+        free(sp_text);
     }
 
-    /* BPE merge */
     n = bpe_merge(ps, ids, n);
-
     int out = (n < max_tokens) ? n : max_tokens;
     memcpy(tokens, ids, out * sizeof(int));
     free(ids);
-    free(sp_text);
     return out;
 }
 
