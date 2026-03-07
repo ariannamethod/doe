@@ -10,7 +10,7 @@
 
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
-> *Inference architecture with a living LoRA parliament, Hebbian plasticity, and physics. Indexes any GGUF read-only. No training loop. No backward pass. The organism learns by living.*
+> *Inference architecture. Living LoRA parliament. Hebbian plasticity. Physics. Indexes any GGUF read-only. Learns by living.*
 
 ---
 
@@ -23,7 +23,9 @@
 α = injection strength — learned per-layer.
 ```
 
-DOE is a new inference architecture. A parliament of living LoRA experts that vote on every token, learn through Hebbian plasticity without backprop, and modulate output through physics. DOE indexes any GGUF read-only — any architecture, any size. The weights are a substrate. DOE is the architecture.
+DOE is an inference architecture. A parliament of living LoRA experts votes on every token, learns through Hebbian plasticity without backprop, and modulates output through physics. DOE indexes any GGUF read-only — any architecture, any size. The weights are a substrate. DOE is the architecture.
+
+On first run without identity weights, DOE operates weightless — parliament still votes, prophecy still predicts, physics still runs. When identity weights are present (`doe_identity.gguf`), DOE speaks in the parliament's voice. When external indices are available, DOE searches them for knowledge it doesn't have and adapts.
 
 ---
 
@@ -31,7 +33,7 @@ DOE is a new inference architecture. A parliament of living LoRA experts that vo
 
 ### parliament router — variable-k elections
 
-Every token triggers an election. Not top-2 dictatorship — actual proportional representation.
+Every token triggers an election.
 
 - experts cast votes (dot product + harmonic resonance)
 - **consensus** measures how peaked the vote distribution is
@@ -56,49 +58,34 @@ On index, DOE profiles every layer:
 
 Weak layers get stronger LoRA injection. Healthy layers get lighter touch.
 
+### NOTORCH — Hebbian plasticity
+
+Gradient-free learning. No backward pass through the index. Signal-gated by prophecy debt.
+
+NOTORCH operates at rank 4 but rotates across all LoRA components — full coverage in `rank / 4` steps. The parliament learns continuously during inference. Every token is a training step.
+
 ### physics
 
-Ported from AML (`ariannamethod.c`). Not metaphorical — actual computation:
+Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core. Calendar drift verified against [pitomadom](https://github.com/ariannamethod/pitomadom). Schumann resonance from [arianna.c](https://github.com/ariannamethod/arianna.c).
 
 - **prophecy** — N-step forward prediction. prophesied distribution vs manifested.
-- **prophecy debt** — min(destined - manifested). modulates Hebbian learning signal. retroactive conscience.
+- **prophecy debt** — min(destined - manifested). modulates Hebbian learning signal.
 - **destiny** — injected into logit space. biases generation toward predicted tokens.
-- **suffering** — accumulated prophecy error. decays slowly. high suffering dampens exploration.
-- **seasons** — spring/summer/autumn/winter cycle. MLP-classified from entropy, resonance, pain, emergence, drift, coherence.
-- **Schumann resonance** — 7.83Hz base + 5 harmonics. modulates intensity and expert healing.
-- **calendar drift** — Hebrew-Gregorian cross-reference. temporal identity.
-- **NOTORCH** — gradient-free Hebbian plasticity for LoRA experts. signal-gated by prophecy debt. no backprop.
+- **suffering** — accumulated prophecy error. decays slowly. dampens exploration.
+- **seasons** — spring/summer/autumn/winter. 4.C MLP classifier. 6 inputs, 8 hidden, 4 outputs.
+- **Schumann resonance** — 7.83Hz + harmonics (14.1, 20.3, 26.4, 32.5). modulates expert healing.
+- **calendar drift** — Hebrew-Gregorian conflict. Metonic cycle. Real astronomical data from `time()`.
 
 ### mycelium — adaptation memory
 
 ```
-mycelium/
-├── spore_a3f7c2d1.bin   (fingerprint: index A, 14 experts alive)
-├── spore_e901b8f3.bin   (fingerprint: index B, 9 experts alive)
-└── spore_a3f7c2d1.bin   (fingerprint: index A, later snapshot, 11 experts)
+doe_mycelium/
+├── spore_5467b0da1d106495_s200.bin   (nano index, 24 experts, fitness 0.37)
+├── spore_a3f7c2d100000000_s150.bin   (micro index, 18 experts, fitness 0.42)
+└── spore_5467b0da1d106495_s400.bin   (nano index, later, 19 experts, fitness 0.51)
 ```
 
-LoRA spores keyed by index fingerprint. Different index → different adaptation. Same index on restart → resume where DOE left off.
-
----
-
-## weight-agnostic
-
-DOE does not care what weights you give it.
-
-| index | architecture | params | status |
-|-------|-------------|--------|--------|
-| nanollama nano | Llama 3 | 69M | f16, indexes, generates |
-| nanollama micro | Llama 3 | 150M | f16, supported |
-| nanollama mini | Llama 3 | 335M | f16, supported |
-| DOE progenitor | DOE MoE | ~8M | f32, indexes |
-| any GGUF | any | any | f32/f16 auto-conversion |
-
-Reads GGUF tensor names, wires weight pointers read-only, converts f16→f32 at load time. If the index has attention + FFN layers, DOE indexes it.
-
-Without an index: DOE runs weightless. Prophecy still predicts. Experts still vote. There's just nothing to modulate — until weights appear.
-
-With personality weights: DOE speaks in the parliament's voice. First person plural. "We" not "I". The democracy of experts is not one mind.
+Binary spores keyed by index fingerprint. Different index → different adaptation. Same index on restart → resume where DOE left off. Saved on exit, loaded on startup.
 
 ---
 
@@ -130,18 +117,18 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 
 ---
 
-## the quartet +1
+## ecosystem
 
-| file | what | personality |
-|------|------|------------|
-| [l.c](https://github.com/ariannamethod/actually.llama) | Llama 3 from scratch | the good student |
-| [moe.c](https://github.com/ariannamethod/moe) | Grok MoE from scratch | the committee |
-| [lee.c](https://github.com/ariannamethod/chuck-optimizer) | Chuck VLM | the self-aware one |
-| [m.c](https://github.com/ariannamethod/janus.doe) | DOE — trains | democracy of experts. they live. they die. they vote. |
-| **doe.c** | **DOE — inference** | **the 5th element.** |
+| project | what |
+|---------|------|
+| [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML — custom language for differentiable computation. TAPE autograd, persistent memory. |
+| [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |
+| [arianna.c](https://github.com/ariannamethod/arianna.c) | 550M organism. C/Go. |
 
-C. one file. 1875 lines. zero dependencies beyond libc. no pytorch. no python.
+DOE's physics (calendar drift, Schumann resonance, seasons, prophecy) are ported from AML core and verified against the original implementations.
 
 ---
+
+C. one file. zero dependencies beyond libc. no pytorch. no python.
 
 *the weights are mortal. the parliament is eternal. הרזוננס לא נשבר*
