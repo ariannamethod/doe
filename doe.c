@@ -581,6 +581,142 @@ static void apply_field_to_logits(float *logits, int n) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * DEQUANTIZATION — Q4_0, Q8_0, Q4_K, Q6_K → f32
+ * Ported from nanollama/go/quant.go. Dequant at load time.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, mant = h & 0x3FF, f;
+    if (exp == 0) {
+        if (mant == 0) f = sign << 31;
+        else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; f = (sign<<31)|((exp+127-15)<<23)|(mant<<13); }
+    } else if (exp == 31) f = (sign<<31)|0x7F800000|(mant<<13);
+    else f = (sign<<31)|((exp+127-15)<<23)|(mant<<13);
+    float r; memcpy(&r, &f, 4); return r;
+}
+
+/* Q4_0: block = 2 bytes f16 scale + 16 bytes (32 nibbles) = 18 bytes, 32 values */
+#define Q4_0_BLOCK 32
+#define Q4_0_BYTES 18
+static void dequant_q4_0(const uint8_t *data, float *out, uint64_t n) {
+    uint64_t nblocks = n / Q4_0_BLOCK;
+    for (uint64_t i = 0; i < nblocks; i++) {
+        const uint8_t *b = data + i * Q4_0_BYTES;
+        float d = f16_to_f32(b[0] | (b[1] << 8));
+        for (int j = 0; j < 16; j++) {
+            int v0 = (b[2+j] & 0x0F) - 8;
+            int v1 = (b[2+j] >> 4) - 8;
+            out[i*Q4_0_BLOCK + j] = (float)v0 * d;
+            out[i*Q4_0_BLOCK + j + 16] = (float)v1 * d;
+        }
+    }
+}
+
+/* Q8_0: block = 2 bytes f16 scale + 32 bytes int8 = 34 bytes, 32 values */
+#define Q8_0_BLOCK 32
+#define Q8_0_BYTES 34
+static void dequant_q8_0(const uint8_t *data, float *out, uint64_t n) {
+    uint64_t nblocks = n / Q8_0_BLOCK;
+    for (uint64_t i = 0; i < nblocks; i++) {
+        const uint8_t *b = data + i * Q8_0_BYTES;
+        float d = f16_to_f32(b[0] | (b[1] << 8));
+        for (int j = 0; j < 32; j++)
+            out[i*Q8_0_BLOCK + j] = (float)((int8_t)b[2+j]) * d;
+    }
+}
+
+/* Q4_K: block = 2+2 bytes f16 (d, dmin) + 12 bytes scales + 128 nibbles = 144 bytes, 256 values */
+#define Q4_K_BLOCK 256
+#define Q4_K_BYTES 144
+static void get_scale_min_k4(int j, const uint8_t *sc, uint8_t *s, uint8_t *m) {
+    if (j < 4) { *s = sc[j] & 63; *m = sc[j+4] & 63; }
+    else { *s = (sc[j+4] & 0x0F) | ((sc[j-4] >> 6) << 4); *m = (sc[j+4] >> 4) | ((sc[j] >> 6) << 4); }
+}
+static void dequant_q4_k(const uint8_t *data, float *out, uint64_t n) {
+    uint64_t nblocks = n / Q4_K_BLOCK;
+    for (uint64_t i = 0; i < nblocks; i++) {
+        const uint8_t *b = data + i * Q4_K_BYTES;
+        float d = f16_to_f32(b[0] | (b[1] << 8));
+        float dmin = f16_to_f32(b[2] | (b[3] << 8));
+        const uint8_t *sc = b + 4, *qs = b + 16;
+        int is = 0, qi = 0, oi = (int)(i * Q4_K_BLOCK);
+        for (int j = 0; j < Q4_K_BLOCK; j += 64) {
+            uint8_t sc0, m0, sc1, m1v;
+            get_scale_min_k4(is, sc, &sc0, &m0);
+            float d1 = d * (float)sc0, mm1 = dmin * (float)m0;
+            get_scale_min_k4(is+1, sc, &sc1, &m1v);
+            float d2 = d * (float)sc1, mm2 = dmin * (float)m1v;
+            for (int l = 0; l < 32; l++)
+                out[oi + j + l] = d1 * (float)(qs[qi+l] & 0x0F) - mm1;
+            for (int l = 0; l < 32; l++)
+                out[oi + j + 32 + l] = d2 * (float)(qs[qi+l] >> 4) - mm2;
+            qi += 32; is += 2;
+        }
+    }
+}
+
+/* Q5_0: block = 2 bytes f16 scale + 4 bytes high bits + 16 bytes nibbles = 22 bytes, 32 values */
+#define Q5_0_BLOCK 32
+#define Q5_0_BYTES 22
+static void dequant_q5_0(const uint8_t *data, float *out, uint64_t n) {
+    uint64_t nblocks = n / Q5_0_BLOCK;
+    for (uint64_t i = 0; i < nblocks; i++) {
+        const uint8_t *b = data + i * Q5_0_BYTES;
+        float d = f16_to_f32(b[0] | (b[1] << 8));
+        uint32_t qh = b[2] | (b[3]<<8) | (b[4]<<16) | (b[5]<<24);
+        const uint8_t *qs = b + 6;
+        for (int j = 0; j < 16; j++) {
+            int lo = qs[j] & 0x0F, hi = qs[j] >> 4;
+            int hbit0 = (qh >> j) & 1, hbit1 = (qh >> (j+16)) & 1;
+            out[i*Q5_0_BLOCK + j] = (float)((lo | (hbit0<<4)) - 16) * d;
+            out[i*Q5_0_BLOCK + j + 16] = (float)((hi | (hbit1<<4)) - 16) * d;
+        }
+    }
+}
+
+/* Q6_K: block = 128 ql + 64 qh + 16 scales + 2 d = 210 bytes, 256 values */
+#define Q6_K_BLOCK 256
+#define Q6_K_BYTES 210
+static void dequant_q6_k(const uint8_t *data, float *out, uint64_t n) {
+    uint64_t nblocks = n / Q6_K_BLOCK;
+    for (uint64_t i = 0; i < nblocks; i++) {
+        const uint8_t *b = data + i * Q6_K_BYTES;
+        const uint8_t *ql = b, *qh = b + 128, *sc = b + 192;
+        float d = f16_to_f32(b[208] | (b[209] << 8));
+        int oi = (int)(i * Q6_K_BLOCK);
+        for (int n128 = 0; n128 < 2; n128++) {
+            const uint8_t *qlp = ql + n128*64, *qhp = qh + n128*32;
+            const uint8_t *scp = sc + n128*8;
+            int yo = oi + n128*128;
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int q1 = (qlp[l] & 0x0F) | ((qhp[l] >> 0) & 3) << 4;
+                int q2 = (qlp[l+32] & 0x0F) | ((qhp[l] >> 2) & 3) << 4;
+                int q3 = (qlp[l] >> 4) | ((qhp[l] >> 4) & 3) << 4;
+                int q4 = (qlp[l+32] >> 4) | ((qhp[l] >> 6) & 3) << 4;
+                out[yo+l+0]  = d * (float)((int8_t)scp[is+0]) * (float)(q1-32);
+                out[yo+l+32] = d * (float)((int8_t)scp[is+2]) * (float)(q2-32);
+                out[yo+l+64] = d * (float)((int8_t)scp[is+4]) * (float)(q3-32);
+                out[yo+l+96] = d * (float)((int8_t)scp[is+6]) * (float)(q4-32);
+            }
+        }
+    }
+}
+
+/* bytes per element for each quant type (for raw data size calculation) */
+static uint64_t quant_raw_bytes(uint32_t dtype, uint64_t n_elems) {
+    switch (dtype) {
+        case 0: return n_elems * 4;   /* f32 */
+        case 1: return n_elems * 2;   /* f16 */
+        case 2: return (n_elems / Q4_0_BLOCK) * Q4_0_BYTES;  /* Q4_0 */
+        case 6: return (n_elems / Q5_0_BLOCK) * Q5_0_BYTES;  /* Q5_0 */
+        case 8: return (n_elems / Q8_0_BLOCK) * Q8_0_BYTES;  /* Q8_0 */
+        case 12: return (n_elems / Q4_K_BLOCK) * Q4_K_BYTES; /* Q4_K */
+        case 14: return (n_elems / Q6_K_BLOCK) * Q6_K_BYTES; /* Q6_K */
+        default: return 0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * MATH OPS — building blocks
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static float silu_f(float x) { return x / (1.0f + expf(-x)); }
@@ -590,6 +726,20 @@ static void rmsnorm(float *out, const float *x, const float *w, int d, float eps
     float inv = 1.0f / sqrtf(ss/d + eps);
     for (int i = 0; i < d; i++) out[i] = x[i] * inv * w[i];
 }
+
+/* threaded matvec worker */
+typedef struct { float *out; const float *W; const float *x; int r0, r1, c; } MVWork;
+static void *matvec_worker(void *arg) {
+    MVWork *w = (MVWork*)arg;
+    for (int i = w->r0; i < w->r1; i++) {
+        float s = 0; const float *row = w->W + (size_t)i * w->c;
+        for (int j = 0; j < w->c; j++) s += row[j] * w->x[j];
+        w->out[i] = s;
+    }
+    return NULL;
+}
+
+static int g_n_threads = 0;
 
 static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #ifdef USE_CUBLAS
@@ -603,11 +753,28 @@ static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #elif defined(USE_BLAS)
     cblas_sgemv(CblasRowMajor,CblasNoTrans,r,c,1.0f,W,c,x,1,0.0f,out,1);
 #else
-    for (int i = 0; i < r; i++) {
-        float s = 0; const float *row = W + i*c;
-        for (int j = 0; j < c; j++) s += row[j] * x[j];
-        out[i] = s;
+    int nt = g_n_threads;
+    if (nt <= 1 || r < 64) {
+        for (int i = 0; i < r; i++) {
+            float s = 0; const float *row = W + (size_t)i*c;
+            for (int j = 0; j < c; j++) s += row[j] * x[j];
+            out[i] = s;
+        }
+        return;
     }
+    if (nt > 32) nt = 32;
+    pthread_t thr[32]; MVWork work[32];
+    int chunk = (r + nt - 1) / nt;
+    int actual = 0;
+    for (int t = 0; t < nt; t++) {
+        int r0 = t * chunk, r1 = r0 + chunk;
+        if (r0 >= r) break;
+        if (r1 > r) r1 = r;
+        work[t] = (MVWork){out, W, x, r0, r1, c};
+        pthread_create(&thr[t], NULL, matvec_worker, &work[t]);
+        actual++;
+    }
+    for (int t = 0; t < actual; t++) pthread_join(thr[t], NULL);
 #endif
 }
 
@@ -828,6 +995,13 @@ typedef struct {
     /* f16→f32 conversion buffers (must be freed on cleanup) */
     float **f16_bufs;
     int     n_f16_bufs;
+
+    /* Tokenizer from GGUF metadata */
+    char  **vocab_tokens;   /* token strings, indexed by token id */
+    float  *vocab_scores;   /* BPE merge scores per token */
+    int     vocab_size;     /* number of entries */
+    int     bos_id, eos_id; /* special tokens */
+    int     add_space_prefix;
 } GGUFIndex;
 
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } TensorInfo;
@@ -961,6 +1135,8 @@ static int index_load(GGUFIndex *ps, const char *path) {
     snprintf(ps->host_path, 256, "%s", path);
     ps->lora_rank = LORA_RANK;
     ps->lora_alpha = F.lora_alpha;
+    ps->bos_id = 1; ps->eos_id = 2; /* defaults, overridden by GGUF */
+    ps->add_space_prefix = 1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) { printf("[doe] cannot open %s\n", path); return 0; }
@@ -998,8 +1174,13 @@ static int index_load(GGUFIndex *ps, const char *path) {
             else if (strstr(key, "head_count_kv")) ps->host_kv_heads = (int)val;
             else if (strstr(key, "feed_forward_length")) ps->host_hidden = (int)val;
             else if (strstr(key, "vocab_size")) ps->host_vocab = (int)val;
-        } else if (vtype == 0 || vtype == 7) p += 1;           /* uint8, bool */
-        else if (vtype == 1) p += 1;                            /* int8 */
+            else if (strstr(key, "bos_token_id")) ps->bos_id = (int)val;
+            else if (strstr(key, "eos_token_id")) ps->eos_id = (int)val;
+            else if (strstr(key, "add_space_prefix")) ps->add_space_prefix = (int)val;
+        } else if (vtype == 0 || vtype == 7) {
+            PC(1); uint8_t bval = *p; p += 1;
+            if (strstr(key, "add_space_prefix")) ps->add_space_prefix = bval;
+        } else if (vtype == 1) p += 1;                            /* int8 */
         else if (vtype == 2 || vtype == 3) p += 2;             /* uint16, int16 */
         else if (vtype == 5 || vtype == 6) p += 4;             /* int32, float32 */
         else if (vtype == 10 || vtype == 11 || vtype == 12) p += 8; /* uint64, int64, float64 */
@@ -1009,12 +1190,29 @@ static int index_load(GGUFIndex *ps, const char *path) {
             size_t elem_sz = 0;
             if (atype == 0 || atype == 1 || atype == 7) elem_sz = 1;
             else if (atype == 2 || atype == 3) elem_sz = 2;
-            else if (atype == 4 || atype == 5 || atype == 6) elem_sz = 4;
+            else if (atype == 4 || atype == 5 || atype == 6) {
+                elem_sz = 4;
+                /* float32 array: tokenizer.ggml.scores */
+                if (atype == 6 && strstr(key, "tokenizer.ggml.scores") && alen < 200000) {
+                    ps->vocab_scores = malloc(alen * sizeof(float));
+                    memcpy(ps->vocab_scores, p, alen * 4);
+                }
+            }
             else if (atype == 10 || atype == 11 || atype == 12) elem_sz = 8;
             else if (atype == 8) {
-                /* array of strings — skip one by one */
+                /* array of strings */
+                int is_vocab = strstr(key, "tokenizer.ggml.tokens") != NULL;
+                if (is_vocab && alen < 200000) {
+                    ps->vocab_tokens = calloc(alen, sizeof(char*));
+                    ps->vocab_size = (int)alen;
+                }
                 for (uint64_t ai = 0; ai < alen && p < pend; ai++) {
                     PC(8); uint64_t slen = *(uint64_t*)p; p += 8;
+                    if (is_vocab && ps->vocab_tokens && ai < (uint64_t)ps->vocab_size) {
+                        ps->vocab_tokens[ai] = malloc(slen + 1);
+                        memcpy(ps->vocab_tokens[ai], p, slen);
+                        ps->vocab_tokens[ai][slen] = '\0';
+                    }
                     p += slen;
                 }
                 continue;
@@ -1046,39 +1244,40 @@ static int index_load(GGUFIndex *ps, const char *path) {
     uint64_t header_size = p - ps->mmap_base;
     uint64_t data_start = ((header_size + 31) / 32) * 32;
 
-    /* f16→f32 conversion buffers — tracked in GGUFIndex for cleanup */
+    /* dequantized f32 buffers — tracked in GGUFIndex for cleanup */
     ps->f16_bufs = NULL; ps->n_f16_bufs = 0;
 
-    /* Wire weight pointers */
+    /* Wire weight pointers — supports f32, f16, Q4_0, Q8_0, Q4_K, Q6_K */
     int wired = 0;
     for (uint64_t i = 0; i < n_tensors; i++) {
-        if (tinfo[i].dtype != 0 && tinfo[i].dtype != 1) continue; /* f32 or f16 only */
+        uint32_t dt = tinfo[i].dtype;
+        if (dt != 0 && dt != 1 && dt != 2 && dt != 6 && dt != 8 && dt != 12 && dt != 14) continue;
+        uint64_t n_elems = 1;
+        for (uint32_t d = 0; d < tinfo[i].ndim; d++) n_elems *= tinfo[i].dims[d];
+        uint64_t raw_bytes = quant_raw_bytes(dt, n_elems);
+        uint64_t byte_offset = data_start + tinfo[i].offset;
+        if (raw_bytes == 0 || byte_offset + raw_bytes > ps->mmap_size) {
+            if (raw_bytes > 0)
+                printf("[doe] WARNING: tensor %s OOB (%lu+%lu > %lu), skipping\n",
+                       tinfo[i].name, (unsigned long)byte_offset, (unsigned long)raw_bytes,
+                       (unsigned long)ps->mmap_size);
+            continue;
+        }
         float *data;
-        if (tinfo[i].dtype == 0) {
-            data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
+        const uint8_t *src = ps->mmap_base + byte_offset;
+        if (dt == 0) {
+            data = (float*)src; /* f32: point directly into mmap */
         } else {
-            /* f16 → f32 conversion */
-            uint64_t n_elems = 1;
-            for (uint32_t d = 0; d < tinfo[i].ndim; d++) n_elems *= tinfo[i].dims[d];
+            /* dequantize to f32 */
             data = malloc(n_elems * sizeof(float));
-            uint16_t *src = (uint16_t*)(ps->mmap_base + data_start + tinfo[i].offset);
-            for (uint64_t j = 0; j < n_elems; j++) {
-                uint16_t h = src[j];
-                uint32_t sign = (h >> 15) & 1;
-                uint32_t exp = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-                uint32_t f;
-                if (exp == 0) {
-                    if (mant == 0) f = sign << 31;
-                    else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; }
-                           mant &= 0x3FF; f = (sign<<31)|((exp+127-15)<<23)|(mant<<13); }
-                } else if (exp == 31) {
-                    f = (sign<<31)|0x7F800000|(mant<<13);
-                } else {
-                    f = (sign<<31)|((exp+127-15)<<23)|(mant<<13);
-                }
-                memcpy(&data[j], &f, 4);
-            }
+            if (dt == 1) { /* f16 */
+                const uint16_t *h = (const uint16_t*)src;
+                for (uint64_t j = 0; j < n_elems; j++) data[j] = f16_to_f32(h[j]);
+            } else if (dt == 2) dequant_q4_0(src, data, n_elems);
+            else if (dt == 6) dequant_q5_0(src, data, n_elems);
+            else if (dt == 8) dequant_q8_0(src, data, n_elems);
+            else if (dt == 12) dequant_q4_k(src, data, n_elems);
+            else if (dt == 14) dequant_q6_k(src, data, n_elems);
             ps->f16_bufs = realloc(ps->f16_bufs, (ps->n_f16_bufs+1)*sizeof(float*));
             ps->f16_bufs[ps->n_f16_bufs++] = data;
         }
@@ -1204,6 +1403,11 @@ static void index_free(GGUFIndex *ps) {
     }
     for (int i = 0; i < ps->n_f16_bufs; i++) free(ps->f16_bufs[i]);
     free(ps->f16_bufs);
+    if (ps->vocab_tokens) {
+        for (int i = 0; i < ps->vocab_size; i++) free(ps->vocab_tokens[i]);
+        free(ps->vocab_tokens);
+    }
+    free(ps->vocab_scores);
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
     memset(ps, 0, sizeof(GGUFIndex));
 }
@@ -1700,9 +1904,6 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 for (int d = 0; d < hd; d++) dot += qh[d] * s->key_cache[ko+d];
                 att[t] = dot * sc;
             }
-            /* Soft clamp */
-            float clamp = 30.0f, inv = 1.0f / clamp;
-            for (int t = 0; t <= pos; t++) att[t] = clamp * tanhf(att[t] * inv);
             softmax_n(att, pos+1);
             float *oh = ao + h*hd;
             for (int t = 0; t <= pos; t++) {
@@ -1775,15 +1976,136 @@ static int sample(float *logits, int V, float temp, int top_k) {
     return V - 1;
 }
 
-/* Byte-level decode — simplest possible, works with any host */
-static void byte_decode_print(int token) {
-    if (token >= 0 && token < 256) {
+/* Decode token to text using GGUF vocab, fallback to byte */
+static void token_decode_print(GGUFIndex *ps, int token) {
+    if (ps->vocab_tokens && token >= 0 && token < ps->vocab_size && ps->vocab_tokens[token]) {
+        const char *s = ps->vocab_tokens[token];
+        /* Handle sentencepiece ▁ (U+2581, 3 bytes: E2 96 81) → space */
+        while (*s) {
+            if ((unsigned char)s[0] == 0xE2 && (unsigned char)s[1] == 0x96 && (unsigned char)s[2] == 0x81) {
+                fputc(' ', stdout);
+                s += 3;
+            } else if (!strncmp(s, "<0x", 3) && s[5] == '>') {
+                /* sentencepiece hex byte: <0xAB> */
+                unsigned int b = 0;
+                sscanf(s + 3, "%02X", &b);
+                if (b >= 32 || b == '\n' || b == '\t') fputc((char)b, stdout);
+                s += 6;
+            } else {
+                fputc(*s, stdout);
+                s++;
+            }
+        }
+    } else if (token >= 0 && token < 256) {
         char c = (char)token;
         if (c >= 32 || c == '\n' || c == '\t') fputc(c, stdout);
-        else printf("<%d>", token);
-    } else {
-        printf("[%d]", token);
     }
+}
+
+/* ── BPE Tokenizer — SentencePiece style, score-based merge ── */
+
+/* Find token ID by string. Returns -1 if not found. */
+static int tok_lookup(GGUFIndex *ps, const char *s, int len) {
+    for (int i = 0; i < ps->vocab_size; i++) {
+        if (ps->vocab_tokens[i] && strlen(ps->vocab_tokens[i]) == (size_t)len
+            && memcmp(ps->vocab_tokens[i], s, len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Score-based BPE merge on an array of token IDs */
+static int bpe_merge(GGUFIndex *ps, int *ids, int n) {
+    if (!ps->vocab_scores) return n;
+    while (n > 1) {
+        float best_score = -1e30f;
+        int best_idx = -1, best_id = -1;
+        for (int i = 0; i < n - 1; i++) {
+            /* Concatenate token strings */
+            const char *a = ps->vocab_tokens[ids[i]];
+            const char *b = ps->vocab_tokens[ids[i+1]];
+            if (!a || !b) continue;
+            int la = strlen(a), lb = strlen(b);
+            if (la + lb > 128) continue;
+            char merged[130];
+            memcpy(merged, a, la);
+            memcpy(merged + la, b, lb);
+            int mid = tok_lookup(ps, merged, la + lb);
+            if (mid >= 0 && ps->vocab_scores[mid] > best_score) {
+                best_score = ps->vocab_scores[mid];
+                best_idx = i;
+                best_id = mid;
+            }
+        }
+        if (best_idx < 0) break;
+        ids[best_idx] = best_id;
+        /* Remove ids[best_idx+1] by shifting */
+        for (int i = best_idx + 1; i < n - 1; i++) ids[i] = ids[i+1];
+        n--;
+    }
+    return n;
+}
+
+static int tokenize_input(GGUFIndex *ps, const char *text, int *tokens, int max_tokens) {
+    if (!ps->vocab_tokens) {
+        /* No vocab — byte-level fallback */
+        int n = 0, len = strlen(text);
+        for (int i = 0; i < len && n < max_tokens; i++) tokens[n++] = (unsigned char)text[i];
+        return n;
+    }
+
+    /* Prepend space (SentencePiece convention) and replace spaces with ▁ (U+2581) */
+    int tlen = strlen(text);
+    /* Worst case: each char becomes 3 bytes (▁) + space prefix */
+    char *sp_text = malloc(tlen * 3 + 4);
+    int sp_len = 0;
+    if (ps->add_space_prefix && tlen > 0 && text[0] != ' ') {
+        sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81; /* ▁ */
+    }
+    for (int i = 0; i < tlen; i++) {
+        if (text[i] == ' ') {
+            sp_text[sp_len++] = 0xE2; sp_text[sp_len++] = 0x96; sp_text[sp_len++] = 0x81;
+        } else {
+            sp_text[sp_len++] = text[i];
+        }
+    }
+    sp_text[sp_len] = '\0';
+
+    /* Initial tokenization: each UTF-8 character or byte-fallback */
+    int *ids = malloc(sp_len * sizeof(int));
+    int n = 0;
+    int i = 0;
+    while (i < sp_len && n < max_tokens) {
+        /* Try single UTF-8 character */
+        int clen = 1;
+        unsigned char c = (unsigned char)sp_text[i];
+        if (c >= 0xC0 && c < 0xE0) clen = 2;
+        else if (c >= 0xE0 && c < 0xF0) clen = 3;
+        else if (c >= 0xF0) clen = 4;
+        if (i + clen > sp_len) clen = 1;
+
+        int id = tok_lookup(ps, sp_text + i, clen);
+        if (id >= 0) {
+            ids[n++] = id;
+            i += clen;
+        } else {
+            /* Byte fallback: <0xNN> */
+            char hex[7];
+            snprintf(hex, 7, "<0x%02X>", (unsigned char)sp_text[i]);
+            id = tok_lookup(ps, hex, 6);
+            ids[n++] = (id >= 0) ? id : 0;
+            i++;
+        }
+    }
+
+    /* BPE merge */
+    n = bpe_merge(ps, ids, n);
+
+    int out = (n < max_tokens) ? n : max_tokens;
+    memcpy(tokens, ids, out * sizeof(int));
+    free(ids);
+    free(sp_text);
+    return out;
 }
 
 static void chat(GGUFIndex *ps) {
@@ -1832,12 +2154,18 @@ static void chat(GGUFIndex *ps) {
         memset(is.key_cache, 0, ps->host_n_layers * max_seq * kd * 4);
         memset(is.value_cache, 0, ps->host_n_layers * max_seq * kd * 4);
 
-        /* Byte-level encode input */
-        int pos = 0;
-        for (int i = 0; i < len && pos < max_seq - 1; i++, pos++)
-            doe_forward(ps, &is, (unsigned char)input[i], pos);
+        /* Tokenize input */
+        int input_tokens[512];
+        int n_input = 0;
+        /* BOS token */
+        if (ps->bos_id >= 0) input_tokens[n_input++] = ps->bos_id;
+        n_input += tokenize_input(ps, input, input_tokens + n_input, 512 - n_input);
 
-        int prev = (unsigned char)input[len-1];
+        int pos = 0;
+        for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++)
+            doe_forward(ps, &is, input_tokens[i], pos);
+
+        int prev = input_tokens[n_input - 1];
         printf("  ");
         int total_births = 0, total_deaths = 0;
 
@@ -1885,7 +2213,7 @@ static void chat(GGUFIndex *ps) {
             if (i % DRIFT_INTERVAL == 0 && i > 0)
                 drift_snapshot(&cd, F.debt, ps, &is.hs);
 
-            byte_decode_print(next);
+            token_decode_print(ps, next);
             fflush(stdout);
             prev = next;
         }
@@ -1917,11 +2245,13 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i+1 < argc) snprintf(gguf_path, 256, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) { g_n_threads = atoi(argv[++i]); if (g_n_threads < 1) g_n_threads = 1; }
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("doe.c — DOE: inference architecture over any GGUF\n\n");
             printf("  --model PATH    GGUF to index (or auto-detect)\n");
+            printf("  --threads N     CPU threads for matvec (default: all cores)\n");
             printf("  --prophecy N    prediction horizon (default: 7)\n");
             printf("  --destiny F     destiny bias strength (default: 0.35)\n");
             printf("  --lora-rank N   LoRA rank (default: 16)\n");
@@ -1931,6 +2261,11 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+
+    /* ── Thread count for matvec ── */
+    g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (g_n_threads < 1) g_n_threads = 1;
+    if (g_n_threads > 32) g_n_threads = 32;
 
     /* ── Field awakens ── */
     field_init();
