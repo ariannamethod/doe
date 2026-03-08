@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 /*
- * doe.c — Democracy of Experts
+ * doe.c — Democracy of Experts. Janus Architercture.
  *
  * inference architecture with a living LoRA parliament.
  * indexes any GGUF read-only. learns by living, not by training.
