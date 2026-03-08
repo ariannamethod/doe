@@ -52,6 +52,93 @@ cc doe.c -O3 -lm -lpthread -o doe
 
 Drop a `doe_identity*.gguf` into `weights/` and DOE auto-detects it on startup. Largest identity file wins.
 
+## architecture
+
+```
+                        +---------------------------+
+                        |     GGUF Host Model        |
+                        |  (mmap'd, read-only, eps)  |
+                        +---------------------------+
+                                    |
+                    +---------------+---------------+
+                    |                               |
+            +-------v--------+             +--------v-------+
+            |  Sonar Profiler |             |  Dual BPE      |
+            |  (per-layer     |             |  Tokenizer     |
+            |   L2, stddev,   |             |  (SentencePiece |
+            |   spectral,     |             |   + GPT-2,     |
+            |   dead neurons) |             |   auto-detect) |
+            +-------+--------+             +--------+-------+
+                    |                               |
+                    v                               v
+        +-----------+-----------+          +--------+--------+
+        |  Parliament per Layer |          |  Token Encoding  |
+        |  +---------+         |          +--------+--------+
+        |  | Expert 0 | LoRA   |                   |
+        |  | Expert 1 | A,B    |                   v
+        |  | Expert 2 | rank r |     +-------------+-----------+
+        |  | ...      |        |     |                         |
+        |  | Expert k | vote   |     |   doe_forward() loop    |
+        |  +---------+         |     |                         |
+        |  Variable-k election |     |  per layer:             |
+        |  consensus-driven    |     |    1. host attention    |
+        +-----------+-----------+     |    2. parliament vote   |
+                    |                |    3. Delta Voice inject |
+                    |                |    4. host FFN (SwiGLU)  |
+                    |                |                         |
+                    +------->--------+    after all layers:    |
+                                     |    5. field modulation  |
+                                     |    6. prophecy debt     |
+                                     |    7. NOTORCH update    |
+                                     +-------------+-----------+
+                                                   |
+                                                   v
+                                     +-------------+-----------+
+                                     |  Sampling + Decode      |
+                                     |  (temp from field,      |
+                                     |   top-k=40)             |
+                                     +-------------------------+
+                                                   |
+                                     +-------------v-----------+
+                                     |  Mycelium Spore Save    |
+                                     |  (binary, per-host      |
+                                     |   fingerprint)          |
+                                     +-------------------------+
+```
+
+## formal definitions
+
+**Election.** Given input `x ∈ R^d` and harmonic state `H`:
+
+```
+k = floor(|E_alive| × (1 - consensus))
+vote(e) = W[e] · x + 0.1 × resonance(freq_e, H)
+S = top_k(votes, k)
+w_i = softmax(vote(S_i))
+```
+
+**Delta Voice.** Modulation of hidden state `x` by elected set `S`:
+
+```
+x' = x + Σ_{i ∈ S} w_i × α × A_i @ (B_i @ x)
+```
+
+**Prophecy Debt.** For logit vector `z ∈ R^V` and chosen token `t`:
+
+```
+D(z, t) = (max(z) - z_t) / (max(z) - z_t + 1)
+```
+
+**NOTORCH Update.** Hebbian plasticity with rotating rank window:
+
+```
+u_j = B[:, j] · dy + N(0, 0.01)
+A[:, j] += σ × lr × x × u_j
+B[:, j] *= decay
+```
+
+Full technical specification: [docs/doe_architecture.md](docs/doe_architecture.md)
+
 ## parliament — variable-k elections
 
 Every token triggers an election. Experts cast votes (dot product + harmonic resonance). Consensus measures how peaked the distribution is. Divided parliament → more experts consulted. Agreement → fewer voices. `k = floor(n_alive × (1 - consensus))`. Softmax over the elected subset.
