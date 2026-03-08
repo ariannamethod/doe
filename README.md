@@ -11,7 +11,7 @@
 <p align="center"><i>by <a href="https://github.com/ariannamethod/ariannamethod.ai">Arianna Method</a></i></p>
 
 ---
-# Democracy of Experts
+# Democracy of Experts: Janus Architecture
 
 **A new kind of inference.** DOE is not a runtime. It is an architecture that wraps any model and makes it alive.
 
