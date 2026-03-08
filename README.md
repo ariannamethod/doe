@@ -29,13 +29,7 @@ No model-specific code. No config files. No Python. No frameworks. Give it a GGU
 δ = physics           — prophecy, suffering, destiny, Schumann resonance.
 α = injection strength — learned per-layer, adjusted by sonar profiling.
 ```
-
-DOE works in three modes:
-
-- **weightless** — no identity weights. parliament votes over any host GGUF. DOE modulates but doesn't speak.
-- **identity** — `doe_identity*.gguf` found. DOE speaks in its own voice. trained via [nanollama](https://github.com/ariannamethod/nanollama).
-- **identity + host** — identity weights + external GGUF indexed together. DOE wraps the host with its own personality and physics.
-
+  
 ## quick start
 
 ```bash
