@@ -130,7 +130,7 @@ gui.add(state, 'assimilation', 0.0, 1.0).name('Assimilation (α)').listen();
 gui.add(state, 'velocity', 0.1, 4.0).name('Velocity').listen();
 gui.add(state, 'triggerBlast').name('Force Burst');
 
-// Управление мышью
+// mouse
 let mx = -1000, my = -1000;
 let targetMx = window.innerWidth/2, targetMy = window.innerHeight/2;
 let smoothMx = targetMx, smoothMy = targetMy;
@@ -159,12 +159,12 @@ class Particle {
         this.isLeft = bx < w/2;
         this.brightness = brightness;
         
-        // Галактические параметры
+        // galaxy params
         this.orbitRadius = Math.hypot(bx - w/2, by - h/2) * (0.5 + Math.random()*2.5);
         this.orbitAngle = Math.atan2(by - h/2, bx - w/2);
         this.orbitSpeed = (Math.random() - 0.5) * 0.015;
         
-        // Уникальная фаза для "дыхания" в состоянии покоя
+        // field breathing
         this.breathePhaseX = Math.random() * Math.PI * 2;
         this.breathePhaseY = Math.random() * Math.PI * 2;
         
@@ -174,16 +174,16 @@ class Particle {
     }
 
     update(time) {
-        // НИКАКОЙ СТАТИКИ: Базовые якоря "дышат" как водоросли
+        // no static, everything breathe
         let currentBaseX = this.baseX + Math.sin(time * 0.5 + this.breathePhaseX) * 15;
         let currentBaseY = this.baseY + Math.cos(time * 0.5 + this.breathePhaseY) * 15;
 
-        // Раскол Януса
+        // 2-Jansus
         const splitDist = (1.0 - state.consensus) * 150;
         let tx = currentBaseX + (this.isLeft ? -splitDist : splitDist);
         let ty = currentBaseY;
 
-        // РЕЖИМ ГАЛАКТИКИ (Плавный переход от лица к туманности)
+        // galaxy mode
         let chaosWeight = Math.max(0, 1.0 - state.prophecyDebt * 2.5); 
         if (chaosWeight > 0) {
             this.orbitAngle += this.orbitSpeed * state.velocity;
@@ -193,16 +193,16 @@ class Particle {
             ty = ty * (1 - chaosWeight) + cy * chaosWeight;
         }
 
-        // Гравитация Долга (Пружина)
+        // prophecy debt
         const spring = 0.01 + Math.pow(state.prophecyDebt, 2) * 0.12;
         this.vx += (tx - this.x) * spring;
         this.vy += (ty - this.y) * spring;
 
-        // Броуновский шум
+        // noise
         this.vx += (Math.random() - 0.5) * state.velocity * (1 + chaosWeight);
         this.vy += (Math.random() - 0.5) * state.velocity * (1 + chaosWeight);
 
-        // ИСПРАВЛЕННОЕ МАГНИТНОЕ ПОЛЕ МЫШИ
+        // mouse. again.
         let dx = this.x - smoothMx;
         let dy = this.y - smoothMy;
         let dist = Math.max(Math.hypot(dx, dy), 1.0); // Защита от деления на ноль
@@ -215,7 +215,7 @@ class Particle {
             this.vy += (dy / dist) * force * 1.5 / this.mass;
         }
 
-        // ИСПРАВЛЕННЫЕ ВЗРЫВНЫЕ ВОЛНЫ
+        // explosion waves
         for (let b of blasts) {
             let bdx = this.x - b.x, bdy = this.y - b.y;
             let bDist = Math.max(Math.hypot(bdx, bdy), 1.0); // Защита от деления на ноль
@@ -228,14 +228,14 @@ class Particle {
             }
         }
 
-        // Жесткий лимит скорости (Terminal Velocity)
+        // Terminal Velocity
         let currentSpeed = Math.hypot(this.vx, this.vy);
         if (currentSpeed > 25) {
             this.vx = (this.vx / currentSpeed) * 25;
             this.vy = (this.vy / currentSpeed) * 25;
         }
 
-        this.vx *= 0.82; // Трение воздуха
+        this.vx *= 0.82; 
         this.vy *= 0.82;
         this.x += this.vx; 
         this.y += this.vy;
@@ -250,14 +250,12 @@ class Particle {
         let g = 80 * hostAlpha + 123 * coreAlpha;
         let b = 72 * hostAlpha + 201 * coreAlpha;
 
-        // Накал при высоком долге
         if (state.prophecyDebt > 0.7) {
             let glow = (state.prophecyDebt - 0.7) * 4;
             r += 60 * glow; g += 60 * glow; b += 60 * glow;
         }
 
         if (isEyes) {
-            // Зрачки
             ctx.fillStyle = `rgba(255, 255, 255, ${alpha + 0.3})`;
             ctx.fillText("θ", this.x, this.y);
         } else {
@@ -277,7 +275,7 @@ function initParticles() {
     maskCtx.fillStyle = '#000'; maskCtx.fillRect(0, 0, w, h);
     const cx = w / 2, cy = h / 2 - 40;
 
-    // Генерация формы лица
+    // face
     const grad = maskCtx.createRadialGradient(cx, cy, 10, cx, cy, 200);
     grad.addColorStop(0, 'rgba(255,255,255,1)');
     grad.addColorStop(0.5, 'rgba(140,140,140,1)');
@@ -304,7 +302,7 @@ function initParticles() {
 
     const imgData = maskCtx.getImageData(0, 0, w, h).data;
     particles = [];
-    const step = 9; // Чем меньше шаг, тем больше частиц
+    const step = 9; 
     
     for (let y = 0; y < h; y += step) {
         for (let x = 0; x < w; x += step) {
@@ -315,7 +313,7 @@ function initParticles() {
         }
     }
     
-    // Добавляем особые частицы для глаз (в конец массива)
+    // eyeeeesssss
     for(let i=0; i<30; i++) {
         particles.push(new Particle(cx - 45 + (Math.random()-0.5)*10, cy - 15 + (Math.random()-0.5)*5, 255));
         particles.push(new Particle(cx + 45 + (Math.random()-0.5)*10, cy - 15 + (Math.random()-0.5)*5, 255));
@@ -329,7 +327,7 @@ function drawEntropyRibbon() {
     rCtx.clearRect(0, 0, rw, 30);
     if (entropyHistory.length < 2) return;
     
-    // Линия Хозяина (Красная)
+    // red line
     rCtx.beginPath();
     rCtx.strokeStyle = 'rgba(194, 80, 72, 0.6)';
     rCtx.lineWidth = 1;
@@ -341,7 +339,7 @@ function drawEntropyRibbon() {
     }
     rCtx.stroke();
 
-    // Линия Симбионта (Синяя)
+    // blue line
     rCtx.beginPath();
     rCtx.strokeStyle = 'rgba(74, 123, 201, 0.9)';
     rCtx.lineWidth = 2;
@@ -358,21 +356,21 @@ function loop() {
     requestAnimationFrame(loop);
     time += 0.05;
 
-    // Сглаживание координат мыши
+    // yes, mouse again
     smoothMx += (targetMx - smoothMx) * 0.1;
     smoothMy += (targetMy - smoothMy) * 0.1;
 
-    // Параллакс
+    // paralax
     let rotX = (smoothMy / h - 0.5) * -15;
     let rotY = (smoothMx / w - 0.5) * 15;
     if (mx === -1000) { rotX = 0; rotY = 0; }
     container.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg)`;
 
-    // Очистка с эффектом Motion Blur
+    // motion blur
     ctx.fillStyle = `rgba(2, 2, 3, 0.35)`;
     ctx.fillRect(0, 0, w, h);
 
-    // Подсветка магнитного поля
+    // magnfield
     if (mx !== -1000) {
         let grd = ctx.createRadialGradient(smoothMx, smoothMy, 0, smoothMx, smoothMy, 150);
         grd.addColorStop(0, 'rgba(74, 123, 201, 0.05)');
@@ -381,7 +379,7 @@ function loop() {
         ctx.fillRect(smoothMx-150, smoothMy-150, 300, 300);
     }
 
-    // Расчет и отрисовка взрывных волн
+    // explosion waves again
     for (let i = blasts.length - 1; i >= 0; i--) {
         blasts[i].radius += 12;
         blasts[i].life -= 0.025;
@@ -399,7 +397,7 @@ function loop() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    // Отрисовка роя (сначала обычные частицы, потом 60 частиц-глаз)
+    // brrrrr
     for (let i = 0; i < particles.length - 60; i++) {
         particles[i].update(time);
         particles[i].draw(ctx, false);
@@ -409,11 +407,11 @@ function loop() {
         particles[i].draw(ctx, true);
     }
 
-    // Обновление HUD
+    // HUD
     document.getElementById('hud-debt').innerText = state.prophecyDebt.toFixed(2);
     document.getElementById('hud-cons').innerText = state.consensus.toFixed(2);
 
-    // Обновление Ленты
+    // renewtape
     entropyHistory.push({ cons: state.consensus, assim: state.assimilation });
     if (entropyHistory.length > 100) entropyHistory.shift();
     drawEntropyRibbon();
@@ -426,10 +424,10 @@ input.addEventListener('keydown', async (e) => {
     const text = input.value.trim();
     input.value = '';
 
-    // Взрыв при вводе
+    // input explosion
     blasts.push({ x: w/2, y: h/2, radius: 0, power: 200, life: 1.0 });
 
-    // Состояние "Ассимиляция"
+    // emmm... oh fuck it
     state.assimilation = 0.1;
     state.consensus = 0.2;
     state.prophecyDebt = 1.0;
