@@ -1,5 +1,29 @@
+doe
+doe_dbg
+doe_dbg.dSYM/
 doe_field
+doe_test
 tests/test_doe
 doe_mycelium/
+weights/
 *.o
 *.gguf
+*.bin
+*.npz
+.DS_Store
+
+# data artifacts
+doe_dataset_raw.jsonl
+doe_personality*.jsonl
+doe_personality*.txt
+personality.txt
+personality_sft*.txt
+sample_*.txt
+stats.txt
+convert_stats.txt
+
+# conversion scripts (keep in repo only if needed)
+convert.awk
+convert.pl
+convert_dataset.sh
+verify.pl

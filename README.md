@@ -13,9 +13,13 @@
 ---
 # Democracy of Experts
 
+**A new kind of inference.** DOE is not a runtime. It is an architecture that wraps any model and makes it alive.
+
 ## what DOE does
 
-DOE indexes any GGUF model read-only and runs inference through a living parliament of LoRA experts. The experts vote on every token, learn in real time through Hebbian plasticity, and die when they stop contributing. Physics modulates the signal. The indexed weights are a substrate — DOE is the architecture on top.
+One C file. ~3200 lines. Zero dependencies. Indexes any GGUF model read-only and runs inference through a living parliament of LoRA experts. The experts vote on every token, learn in real time through Hebbian plasticity, and die when they stop contributing. Physics modulates the signal. The indexed weights are a substrate — DOE is the architecture on top.
+
+No model-specific code. No config files. No Python. No frameworks. Give it a GGUF — any architecture, any size, any quantization — and DOE wraps it with a parliament that adapts in real time. The weights never change. The parliament evolves.
 
 ```
 θ = ε + γ + αδ
@@ -69,7 +73,7 @@ On index, DOE profiles every layer: L2 norms, standard deviation, spectral densi
 
 ## physics
 
-Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core. Calendar drift verified against 
+Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core.
 
 - **prophecy** — N-step forward prediction. prophesied distribution vs manifested.
 - **prophecy debt** — min(destined - manifested). gates Hebbian learning.
@@ -105,7 +109,13 @@ Starts a built-in HTTP server. No dependencies. No Node. No Python.
 | `GET /health` | JSON status (model, arch, params, debt, health) |
 | `POST /chat/completions` | SSE token stream — compatible with doe_ui.html |
 
-The parliament terminal shows DOE's face assembling from character particles. Prophecy debt controls coherence — high debt = face forms, low debt = galactic chaos. Every token from real inference triggers visual feedback.
+### doe.html — parliament terminal
+
+DOE's face assembles from character particles in real time. Prophecy debt controls coherence — high debt = face forms, low debt = galactic chaos. Every token from inference triggers visual feedback. This is not a dashboard. It is a window into the parliament's state during generation.
+
+### doe_ui.html — chat interface
+
+Clean chat UI with streaming responses. Connects to DOE's built-in HTTP server via SSE. No Node. No React. One HTML file.
 
 ---
 
@@ -178,18 +188,30 @@ Architecture-specific handling:
 
 ---
 
+## what's novel
+
+Most inference engines are runtimes — they load weights and execute a fixed computation graph. DOE is different:
+
+- **Architecture-agnostic wrapping.** One binary indexes Llama, Qwen2, Mistral, SmolLM, Gemma, Phi-3, nanollama. No per-model code paths. No config files. Auto-detected from GGUF metadata.
+- **Living topology.** Expert count changes during inference. Experts are born, die, and vote. The architecture is not static — it evolves per token.
+- **Inference-time learning.** Every forward pass updates LoRA experts via Hebbian plasticity (NOTORCH). No backward pass. No training loop. The model improves as it generates.
+- **Adaptive injection.** Sonar profiles each layer at index time. Weak layers get stronger LoRA. Healthy layers get lighter touch. Per-layer, per-model, automatic.
+- **Physics-modulated generation.** Prophecy, suffering, destiny, Schumann resonance, calendar drift — not bolted on, but integrated into the logit pipeline.
+
+## architecture document
+
+See [docs/doe_architecture.md](docs/doe_architecture.md) for the full technical specification — formal definitions, mathematical formulations, and subsystem descriptions.
+
 ## ecosystem
 
 | project | what |
 |---------|------|
-| [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML — custom language for differentiable computation. TAPE autograd, persistent memory. |
-| [nanollama](https://github.com/ariannamethod/nanollama) | Llama 3 training framework. DOE identity weights trained here. |
-|  [molequla](https://github.com/ariannamethod/molequla) | autonomous GPT ecology. 4 organisms, AML/C CGO training, mitosis, DNA exchange. |  
+| [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML v4.5 — the language. TAPE autograd, bytecode compilation, CUDA backend. |
+| [molequla](https://github.com/ariannamethod/molequla) | Autonomous GPT ecology. 4 organisms, AML/C CGO, mitosis. |
+| [chuck.optimizer](https://github.com/ariannamethod/chuck.optimizer) | Self-aware optimizer. 9 levels of introspection. Used in DOE training. |
 
-  
 ---
 
 C. one file. zero dependencies beyond libc.
 
 *the weights are mortal. the parliament is eternal.*
-resonance unbroken.
