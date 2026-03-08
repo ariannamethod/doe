@@ -513,15 +513,9 @@ On startup, DOE computes the host's fingerprint and searches `doe_mycelium/` for
 
 On exit (or periodically), the current parliament state is saved as a new spore. Old spores are not automatically pruned -- the directory serves as a fossil record of adaptation history.
 
-### 8.3 Three Operating Modes
+### 8.3 Operating Mode
 
-| Mode | Condition | Behavior |
-|------|-----------|----------|
-| **Weightless** | No `doe_identity.gguf` found | DOE wraps an external host model. Parliament self-organizes from random initialization. |
-| **Identity** | `doe_identity.gguf` present | DOE uses its own weights as the host. The model IS DOE. |
-| **Identity + Host** | Identity GGUF + external host | DOE has its own weights AND wraps an external model. Gamma personality applies. |
-
-Gamma (`doe_gamma.bin`) is a raw binary blob loaded separately from the identity GGUF, representing personality state that persists across different host models.
+DOE indexes any GGUF model as a read-only host. The parliament wraps it, adapts via NOTORCH, and persists adaptation as spores keyed by the host's fingerprint.
 
 ---
 

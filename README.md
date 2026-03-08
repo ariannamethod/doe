@@ -19,7 +19,7 @@
 
 One C file. ~3200 lines. Zero dependencies. Indexes any GGUF model read-only and runs inference through a living parliament of LoRA experts. The experts vote on every token, learn in real time through Hebbian plasticity, and die when they stop contributing. Physics modulates the signal. The indexed weights are a substrate — DOE is the architecture on top.
 
-No model-specific code. No config files. No Python. No frameworks. Give it a GGUF — any architecture, any size, any quantization — and DOE wraps it with a parliament that adapts in real time. The weights never change. The parliament evolves.
+Give it a GGUF — any architecture, any size, any quantization — and DOE wraps it with a parliament that adapts in real time. The weights never change. The parliament evolves.
 
 ```
 θ = ε + γ + αδ
@@ -29,7 +29,8 @@ No model-specific code. No config files. No Python. No frameworks. Give it a GGU
 δ = physics           — prophecy, suffering, destiny, Schumann resonance.
 α = injection strength — learned per-layer, adjusted by sonar profiling.
 ```
-  
+
+
 ## quick start
 
 ```bash
@@ -44,7 +45,6 @@ cc doe.c -O3 -lm -lpthread -o doe
 # open http://localhost:8080/visual → parliament terminal
 ```
 
-Drop a `doe_identity*.gguf` into `weights/` and DOE auto-detects it on startup. Largest identity file wins.
 
 ## architecture
 
