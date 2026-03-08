@@ -13,7 +13,7 @@
 ---
 # Democracy of Experts: Janus Architecture
 
-**A new kind of inference.** DOE is not a runtime. It is an architecture that wraps any model and makes it alive.
+**A new kind of inference.** DOE is agnostic. DOE wraps any GGUF and makes it alive.
 
 ## what DOE does
 
