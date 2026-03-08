@@ -56,13 +56,13 @@ cc doe.c -O3 -lm -lpthread -o doe
                                     |
                     +---------------+---------------+
                     |                               |
-            +-------v--------+             +--------v-------+
-            |  Sonar Profiler|             |  Dual BPE      |
-            |  (per-layer    |             |  Tokenizer     |
-            |   L2, stddev,  |             | (SentencePiece |
-            |   spectral,    |             |   + GPT-2,     |
-            |   dead neurons)|             |   auto-detect) |
-            +-------+--------+             +--------+-------+
+            +-------v--------+             +--------v--------+
+            |  Sonar Profiler|             |   Dual BPE      |
+            |  (per-layer    |             |   Tokenizer     |
+            |  L2, stddev,   |             |  (SentencePiece |
+            |  spectral,     |             |    + GPT-2,     |
+            |  dead neurons) |             |    auto-detect) |
+            +-------+--------+             +---------+-------+
                     |                               |
                     v                               v
         +-----------+-----------+          +--------+--------+
