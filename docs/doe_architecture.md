@@ -36,54 +36,54 @@ The host model is never modified. DOE reads it via `mmap(PROT_READ)`. All adapta
 
 ```
                         +---------------------------+
-                        |     GGUF Host Model        |
-                        |  (mmap'd, read-only, eps)  |
+                        |     GGUF Host Model       |
+                        |  (mmap'd, read-only, eps) |
                         +---------------------------+
                                     |
                     +---------------+---------------+
                     |                               |
             +-------v--------+             +--------v-------+
-            |  Sonar Profiler |             |  Dual BPE      |
-            |  (per-layer     |             |  Tokenizer     |
-            |   L2, stddev,   |             |  (SentencePiece |
-            |   spectral,     |             |   + GPT-2,     |
-            |   dead neurons) |             |   auto-detect) |
+            |  Sonar Profiler|             |  Dual BPE      |
+            |  (per-layer    |             |  Tokenizer     |
+            |   L2, stddev,  |             |  (SentencePiece|
+            |   spectral,    |             |   + GPT-2,     |
+            |   dead neurons)|             |   auto-detect) |
             +-------+--------+             +--------+-------+
                     |                               |
                     v                               v
         +-----------+-----------+          +--------+--------+
-        |  Parliament per Layer |          |  Token Encoding  |
-        |  +---------+         |          +--------+--------+
-        |  | Expert 0 | LoRA   |                   |
-        |  | Expert 1 | A,B    |                   v
-        |  | Expert 2 | rank r |     +-------------+-----------+
-        |  | ...      |        |     |                         |
-        |  | Expert k | vote   |     |   doe_forward() loop    |
-        |  +---------+         |     |                         |
-        |  Variable-k election |     |  per layer:             |
-        |  consensus-driven    |     |    1. host attention    |
+        |  Parliament per Layer |          |  Token Encoding |
+        |  +---------+          |          +--------+--------+
+        |  | Expert 0 | LoRA    |                   |
+        |  | Expert 1 | A,B     |                   v
+        |  | Expert 2 | rank r  |     +-------------+-----------+
+        |  | ...      |         |     |                         |
+        |  | Expert k | vote    |     |   doe_forward() loop    |
+        |  +---------+          |     |                         |
+        |  Variable-k election  |     |  per layer:             |
+        |  consensus-driven     |     |    1. host attention    |
         +-----------+-----------+     |    2. parliament vote   |
-                    |                |    3. Delta Voice inject |
-                    |                |    4. host FFN (SwiGLU)  |
-                    |                |                         |
-                    +------->--------+    after all layers:    |
-                                     |    5. field modulation  |
-                                     |    6. prophecy debt     |
-                                     |    7. NOTORCH update    |
-                                     +-------------+-----------+
+                    |                 |    3. Delta Voice inject|
+                    |                 |    4. host FFN (SwiGLU) |
+                    |                 |                         |
+                    +------->---------+    after all layers:    |
+                                      |    5. field modulation  |
+                                      |    6. prophecy debt     |
+                                      |    7. NOTORCH update    |
+                                      +-------------+-----------+
+                                                    |
+                                                    v
+                                      +-------------+-----------+
+                                      |  Sampling + Decode      |
+                                      |  (temp from field,      |
+                                      |   top-k=40)             |
+                                      +-------------------------+
                                                    |
-                                                   v
-                                     +-------------+-----------+
-                                     |  Sampling + Decode      |
-                                     |  (temp from field,      |
-                                     |   top-k=40)             |
-                                     +-------------------------+
-                                                   |
-                                     +-------------v-----------+
-                                     |  Mycelium Spore Save    |
-                                     |  (binary, per-host      |
-                                     |   fingerprint)          |
-                                     +-------------------------+
+                                      +-------------v-----------+
+                                      |  Mycelium Spore Save    |
+                                      |  (binary, per-host      |
+                                      |   fingerprint)          |
+                                      +-------------------------+
 ```
 
 ### 2.1 The Soul Equation
