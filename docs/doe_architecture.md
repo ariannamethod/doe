@@ -1,4 +1,4 @@
-# DOE: Democracy of Experts
+# DOE: Democracy of Experts. Janus Architecture
 
 ## A Living Inference Architecture with Gradient-Free Hebbian Plasticity
 
