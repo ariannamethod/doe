@@ -439,58 +439,388 @@ static void test_prophecy_debt_edge_cases(void) {
 /* ═══════════════════════════════════════════════════════════════════
  * field → logits pipeline tests
  * ═══════════════════════════════════════════════════════════════════ */
-static void test_apply_destiny(void) {
-    TEST(apply_destiny);
-    field_init();
-    F.destiny_bias = 0.5f;
-    float logits[] = {5.0f, 3.0f, 1.0f};
-    float orig[3]; memcpy(orig, logits, sizeof(orig));
-    apply_destiny(logits, 3);
-    /* max is 5.0, so tokens with lower logits get pushed down more */
-    ASSERT_FLOAT_EQ(logits[0], orig[0], 1e-5f, "max token unchanged by destiny");
-    ASSERT_TRUE(logits[1] < orig[1], "non-max tokens suppressed");
-    ASSERT_TRUE(logits[2] < orig[2], "weakest token suppressed most");
+/* ═══════════════════════════════════════════════════════════════════
+ * Dario Equation tests
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_dario_field_init(void) {
+    TEST(dario_field_init);
+    dario_field_init();
+    ASSERT_FLOAT_EQ(DF.alpha, DARIO_ALPHA, 1e-7f, "alpha should be DARIO_ALPHA");
+    ASSERT_FLOAT_EQ(DF.beta, DARIO_BETA, 1e-7f, "beta should be DARIO_BETA");
+    ASSERT_FLOAT_EQ(DF.gamma_d, DARIO_GAMMA, 1e-7f, "gamma should be DARIO_GAMMA");
+    ASSERT_FLOAT_EQ(DF.alpha_mod, 1.0f, 1e-7f, "alpha_mod should start at 1.0");
+    ASSERT_FLOAT_EQ(DF.beta_mod, 1.0f, 1e-7f, "beta_mod should start at 1.0");
+    ASSERT_FLOAT_EQ(DF.gamma_mod, 1.0f, 1e-7f, "gamma_mod should start at 1.0");
+    ASSERT_FLOAT_EQ(DF.tau_mod, 1.0f, 1e-7f, "tau_mod should start at 1.0");
+    ASSERT_TRUE(DF.cooc_n == 0, "cooc_n should be 0 after init");
+    ASSERT_TRUE(DF.ctx_len == 0, "ctx_len should be 0 after init");
+    ASSERT_TRUE(DF.prophecy_n == 0, "prophecy_n should be 0 after init");
+    ASSERT_FLOAT_EQ(DF.trauma, 0.0f, 1e-7f, "trauma should be 0 after init");
     PASS();
 }
 
-static void test_apply_destiny_zero_bias(void) {
-    TEST(apply_destiny_zero_bias);
-    field_init();
-    F.destiny_bias = 0.0f;
-    float logits[] = {5.0f, 3.0f, 1.0f};
-    float orig[3]; memcpy(orig, logits, sizeof(orig));
-    apply_destiny(logits, 3);
-    for (int i = 0; i < 3; i++)
-        ASSERT_FLOAT_EQ(logits[i], orig[i], 1e-7f, "zero bias => no change");
+static void test_dario_clampf(void) {
+    TEST(dario_clampf);
+    ASSERT_FLOAT_EQ(dario_clampf(-1.0f, 0.0f, 1.0f), 0.0f, 1e-7f, "clamp below");
+    ASSERT_FLOAT_EQ(dario_clampf(2.0f, 0.0f, 1.0f), 1.0f, 1e-7f, "clamp above");
+    ASSERT_FLOAT_EQ(dario_clampf(0.5f, 0.0f, 1.0f), 0.5f, 1e-7f, "clamp within");
     PASS();
 }
 
-static void test_apply_suffering(void) {
-    TEST(apply_suffering);
-    field_init();
-    F.pain = 0.8f;
-    F.tension = 0.5f;
-    float logits[] = {10.0f, 0.0f, 5.0f};
-    apply_suffering(logits, 3);
-    /* suffering compresses toward mean. spread should decrease */
-    float mean = (logits[0] + logits[1] + logits[2]) / 3.0f;
-    float var = 0;
-    for (int i = 0; i < 3; i++) var += (logits[i] - mean) * (logits[i] - mean);
-    /* original variance was much higher */
-    float orig_var = ((10-5)*(10-5) + (0-5)*(0-5) + (5-5)*(5-5));
-    ASSERT_TRUE(var < orig_var, "suffering should reduce variance");
+static void test_dario_embed_deterministic(void) {
+    TEST(dario_embed_deterministic);
+    dario_field_init();
+    float *e1 = dario_get_embed(42);
+    ASSERT_TRUE(e1 != NULL, "embed should not be null for valid id");
+    float first_val = e1[0];
+    /* reset and recompute — should be same (deterministic from hash) */
+    DF.embed_init[42] = 0;
+    float *e2 = dario_get_embed(42);
+    ASSERT_FLOAT_EQ(e2[0], first_val, 1e-7f, "hash-based embed must be deterministic");
     PASS();
 }
 
-static void test_apply_attention(void) {
-    TEST(apply_attention);
+static void test_dario_embed_normalized(void) {
+    TEST(dario_embed_normalized);
+    dario_field_init();
+    float *e = dario_get_embed(100);
+    ASSERT_TRUE(e != NULL, "embed should not be null");
+    float norm = 0;
+    for (int d = 0; d < DARIO_DIM; d++) norm += e[d] * e[d];
+    ASSERT_FLOAT_EQ(sqrtf(norm), 1.0f, 1e-4f, "embeddings should be unit normalized");
+    PASS();
+}
+
+static void test_dario_embed_different_ids(void) {
+    TEST(dario_embed_different_ids);
+    dario_field_init();
+    float *e1 = dario_get_embed(10);
+    float *e2 = dario_get_embed(11);
+    /* different IDs should produce different embeddings */
+    int differ = 0;
+    for (int d = 0; d < DARIO_DIM; d++)
+        if (fabsf(e1[d] - e2[d]) > 1e-6f) differ++;
+    ASSERT_TRUE(differ > 0, "different IDs must produce different embeddings");
+    PASS();
+}
+
+static void test_dario_embed_null_oob(void) {
+    TEST(dario_embed_null_oob);
+    ASSERT_TRUE(dario_get_embed(-1) == NULL, "negative id should return NULL");
+    ASSERT_TRUE(dario_get_embed(2048) == NULL, "id >= 2048 should return NULL");
+    PASS();
+}
+
+static void test_dario_cosine_self(void) {
+    TEST(dario_cosine_self);
+    dario_field_init();
+    float *e = dario_get_embed(50);
+    float cos_self = dario_cosine(e, e);
+    ASSERT_FLOAT_EQ(cos_self, 1.0f, 1e-4f, "cosine of vector with itself should be 1");
+    PASS();
+}
+
+static void test_dario_cosine_different(void) {
+    TEST(dario_cosine_different);
+    dario_field_init();
+    float *e1 = dario_get_embed(0);
+    float *e2 = dario_get_embed(500);
+    float cos_val = dario_cosine(e1, e2);
+    /* hash-based embeddings: different tokens should not be perfectly aligned */
+    ASSERT_TRUE(cos_val < 0.99f, "different tokens should not be cosine=1");
+    ASSERT_TRUE(cos_val > -1.01f, "cosine should be >= -1");
+    PASS();
+}
+
+static void test_dario_cooc_update_new(void) {
+    TEST(dario_cooc_update_new);
+    dario_field_init();
+    dario_cooc_update(10, 20, 0.5f);
+    ASSERT_TRUE(DF.cooc_n == 1, "should have 1 co-occurrence");
+    ASSERT_TRUE(DF.cooc_src[0] == 10, "src should be 10");
+    ASSERT_TRUE(DF.cooc_dst[0] == 20, "dst should be 20");
+    ASSERT_FLOAT_EQ(DF.cooc_val[0], 0.5f, 1e-7f, "val should be 0.5");
+    PASS();
+}
+
+static void test_dario_cooc_update_existing(void) {
+    TEST(dario_cooc_update_existing);
+    dario_field_init();
+    dario_cooc_update(10, 20, 0.5f);
+    dario_cooc_update(10, 20, 0.3f);
+    ASSERT_TRUE(DF.cooc_n == 1, "same pair should not create duplicate");
+    ASSERT_FLOAT_EQ(DF.cooc_val[0], 0.8f, 1e-6f, "val should accumulate: 0.5+0.3=0.8");
+    PASS();
+}
+
+static void test_dario_prophecy_add(void) {
+    TEST(dario_prophecy_add);
+    dario_field_init();
+    dario_prophecy_add(42, 0.7f);
+    ASSERT_TRUE(DF.prophecy_n == 1, "should have 1 prophecy");
+    ASSERT_TRUE(DF.prophecy[0].target == 42, "target should be 42");
+    ASSERT_FLOAT_EQ(DF.prophecy[0].strength, 0.7f, 1e-7f, "strength 0.7");
+    ASSERT_TRUE(DF.prophecy[0].age == 0, "new prophecy age should be 0");
+    ASSERT_TRUE(DF.prophecy[0].fulfilled == 0, "new prophecy not fulfilled");
+    PASS();
+}
+
+static void test_dario_prophecy_overflow(void) {
+    TEST(dario_prophecy_overflow);
+    dario_field_init();
+    /* fill all slots */
+    for (int i = 0; i < DARIO_MAX_PROPH; i++) {
+        dario_prophecy_add(i, 0.5f);
+        DF.prophecy[i].age = i; /* older = higher index */
+    }
+    /* add one more — should evict oldest */
+    dario_prophecy_add(999, 0.9f);
+    ASSERT_TRUE(DF.prophecy_n == DARIO_MAX_PROPH, "count should stay at max");
+    /* check that the new one exists */
+    int found = 0;
+    for (int i = 0; i < DF.prophecy_n; i++)
+        if (DF.prophecy[i].target == 999) found = 1;
+    ASSERT_TRUE(found, "new prophecy should exist after overflow eviction");
+    PASS();
+}
+
+static void test_dario_prophecy_update_fulfills(void) {
+    TEST(dario_prophecy_update_fulfills);
+    dario_field_init();
+    dario_prophecy_add(42, 0.5f);
+    dario_prophecy_add(99, 0.3f);
+    ASSERT_TRUE(DF.prophecy_n == 2, "should have 2 prophecies");
+    dario_prophecy_update(42);
+    /* 42 was fulfilled and should be removed (fulfilled prophecies are pruned) */
+    /* 99 should remain with age incremented */
+    ASSERT_TRUE(DF.prophecy_n == 1, "fulfilled prophecy should be removed");
+    ASSERT_TRUE(DF.prophecy[0].target == 99, "unfulfilled prophecy remains");
+    ASSERT_TRUE(DF.prophecy[0].age == 1, "age should increment");
+    PASS();
+}
+
+static void test_dario_prophecy_update_old_expire(void) {
+    TEST(dario_prophecy_update_old_expire);
+    dario_field_init();
+    dario_prophecy_add(42, 0.5f);
+    DF.prophecy[0].age = 49;
+    dario_prophecy_update(0); /* not matching, age goes to 50 */
+    ASSERT_TRUE(DF.prophecy_n == 0, "prophecy aged >=50 should be pruned");
+    PASS();
+}
+
+static void test_dario_ingest_builds_context(void) {
+    TEST(dario_ingest_builds_context);
+    dario_field_init();
     field_init();
-    F.attend_focus = 0.8f;
-    float logits[] = {10.0f, 5.0f, 1.0f};
-    apply_attention(logits, 3);
-    /* attention sharpens: pushes non-max down */
-    ASSERT_TRUE(logits[1] < 5.0f, "attention should sharpen: non-max pushed down");
-    ASSERT_TRUE(logits[2] < 1.0f, "attention should sharpen: weak pushed lower");
+    dario_ingest(10);
+    dario_ingest(20);
+    dario_ingest(30);
+    ASSERT_TRUE(DF.ctx_len == 3, "context length should be 3");
+    ASSERT_TRUE(DF.context[0] == 10, "context[0] should be 10");
+    ASSERT_TRUE(DF.context[1] == 20, "context[1] should be 20");
+    ASSERT_TRUE(DF.context[2] == 30, "context[2] should be 30");
+    PASS();
+}
+
+static void test_dario_ingest_context_overflow(void) {
+    TEST(dario_ingest_context_overflow);
+    dario_field_init();
+    field_init();
+    /* fill context to max */
+    for (int i = 0; i < DARIO_MAX_CTX + 5; i++)
+        dario_ingest(i % 2048);
+    ASSERT_TRUE(DF.ctx_len == DARIO_MAX_CTX, "context should cap at DARIO_MAX_CTX");
+    /* last element should be the last ingested token */
+    ASSERT_TRUE(DF.context[DARIO_MAX_CTX - 1] == (DARIO_MAX_CTX + 4) % 2048,
+                "last context entry should be most recent token");
+    PASS();
+}
+
+static void test_dario_ingest_updates_destiny(void) {
+    TEST(dario_ingest_updates_destiny);
+    dario_field_init();
+    field_init();
+    /* destiny starts at 0, after ingest should have magnitude > 0 */
+    dario_ingest(100);
+    ASSERT_TRUE(DF.dest_magnitude > 1e-6f, "destiny magnitude should be > 0 after ingest");
+    PASS();
+}
+
+static void test_dario_ingest_creates_cooc(void) {
+    TEST(dario_ingest_creates_cooc);
+    dario_field_init();
+    field_init();
+    dario_ingest(10);
+    dario_ingest(20); /* token 20 should co-occur with context token 10 */
+    ASSERT_TRUE(DF.cooc_n > 0, "co-occurrence entries should exist after 2 tokens");
+    /* find the (10, 20) pair */
+    int found = 0;
+    for (int i = 0; i < DF.cooc_n; i++)
+        if (DF.cooc_src[i] == 10 && DF.cooc_dst[i] == 20) found = 1;
+    ASSERT_TRUE(found, "co-occurrence (10 -> 20) should exist");
+    PASS();
+}
+
+static void test_dario_ingest_creates_prophecy(void) {
+    TEST(dario_ingest_creates_prophecy);
+    dario_field_init();
+    field_init();
+    dario_ingest(10);
+    dario_ingest(20); /* creates cooc (10->20) */
+    dario_ingest(10); /* sees token 10 again, strongest cooc is 20, should predict 20 */
+    ASSERT_TRUE(DF.prophecy_n > 0, "prophecy should exist after repeated pattern");
+    PASS();
+}
+
+static void test_dario_ingest_trauma_from_dissonance(void) {
+    TEST(dario_ingest_trauma_from_dissonance);
+    dario_field_init();
+    field_init();
+    F.dissonance = 0.9f; /* high dissonance */
+    DF.trauma = 0.0f;
+    dario_ingest(10);
+    ASSERT_TRUE(DF.trauma > 0.0f, "high dissonance should cause trauma");
+    PASS();
+}
+
+static void test_dario_ingest_no_trauma_low_dissonance(void) {
+    TEST(dario_ingest_no_trauma_low_dissonance);
+    dario_field_init();
+    field_init();
+    F.dissonance = 0.3f; /* low dissonance */
+    DF.trauma = 0.0f;
+    dario_ingest(10);
+    /* trauma gain only fires if dissonance > 0.7, but decay still runs */
+    ASSERT_FLOAT_EQ(DF.trauma, 0.0f, 1e-6f, "low dissonance should not create trauma");
+    PASS();
+}
+
+static void test_dario_chamber_update_baseline(void) {
+    TEST(dario_chamber_update_baseline);
+    dario_field_init();
+    field_init();
+    /* all chambers 0, low field values — should remain ~0 */
+    dario_chamber_update();
+    for (int i = 0; i < DARIO_NUM_CH; i++)
+        ASSERT_TRUE(DF.chamber[i] >= 0.0f && DF.chamber[i] <= 1.0f,
+                     "chamber values should be in [0,1]");
+    PASS();
+}
+
+static void test_dario_chamber_fear_from_dissonance(void) {
+    TEST(dario_chamber_fear_from_dissonance);
+    dario_field_init();
+    field_init();
+    F.dissonance = 0.95f;
+    dario_chamber_update();
+    ASSERT_TRUE(DF.chamber[DCH_FEAR] > 0.0f, "high dissonance should excite FEAR");
+    PASS();
+}
+
+static void test_dario_chamber_love_from_resonance(void) {
+    TEST(dario_chamber_love_from_resonance);
+    dario_field_init();
+    field_init();
+    F.resonance = 0.9f;
+    dario_chamber_update();
+    ASSERT_TRUE(DF.chamber[DCH_LOVE] > 0.0f, "high resonance should excite LOVE");
+    PASS();
+}
+
+static void test_dario_chamber_modulates_coefficients(void) {
+    TEST(dario_chamber_modulates_coefficients);
+    dario_field_init();
+    field_init();
+    /* pump FEAR hard — should suppress beta_mod */
+    DF.chamber[DCH_FEAR] = 0.8f;
+    dario_chamber_update();
+    ASSERT_TRUE(DF.beta_mod < 1.0f, "FEAR should suppress beta_mod (prophecy)");
+    PASS();
+}
+
+static void test_dario_chamber_tau_mod_range(void) {
+    TEST(dario_chamber_tau_mod_range);
+    dario_field_init();
+    field_init();
+    /* run many chamber updates with extreme values */
+    F.dissonance = 1.0f; F.resonance = 1.0f; F.entropy = 1.0f; F.emergence = 1.0f;
+    DF.trauma = 1.0f;
+    for (int i = 0; i < 100; i++) dario_chamber_update();
+    ASSERT_TRUE(DF.tau_mod >= 0.5f && DF.tau_mod <= 2.0f,
+                "tau_mod should be clamped to [0.5, 2.0]");
+    ASSERT_TRUE(DF.alpha_mod >= 0.5f && DF.alpha_mod <= 2.0f,
+                "alpha_mod should be clamped to [0.5, 2.0]");
+    PASS();
+}
+
+static void test_dario_apply_field_to_logits_additive(void) {
+    TEST(dario_apply_field_to_logits_additive);
+    dario_field_init();
+    field_init();
+    /* seed some field state */
+    dario_ingest(10);
+    dario_ingest(20);
+    dario_ingest(30);
+    float logits[64];
+    float orig[64];
+    for (int i = 0; i < 64; i++) logits[i] = orig[i] = (float)i * 0.1f;
+    apply_field_to_logits(logits, 64);
+    /* logits should be modified (additive overlay) */
+    int changed = 0;
+    for (int i = 0; i < 64; i++)
+        if (fabsf(logits[i] - orig[i]) > 1e-8f) changed++;
+    ASSERT_TRUE(changed > 0, "apply_field_to_logits should modify at least some logits");
+    PASS();
+}
+
+static void test_dario_apply_field_to_logits_empty(void) {
+    TEST(dario_apply_field_to_logits_empty);
+    dario_field_init();
+    field_init();
+    /* no ingest — empty field. should still not crash */
+    float logits[32];
+    for (int i = 0; i < 32; i++) logits[i] = 1.0f;
+    apply_field_to_logits(logits, 32);
+    /* with empty field, H/F/A signals are ~0, tau_mod=1 */
+    ASSERT_TRUE(1, "should not crash with empty field state");
+    PASS();
+}
+
+static void test_dario_apply_field_to_logits_zero_n(void) {
+    TEST(dario_apply_field_to_logits_zero_n);
+    /* n=0 should be a no-op */
+    apply_field_to_logits(NULL, 0);
+    ASSERT_TRUE(1, "n=0 should be safe no-op");
+    PASS();
+}
+
+static void test_dario_trauma_boosts_low_tokens(void) {
+    TEST(dario_trauma_boosts_low_tokens);
+    dario_field_init();
+    field_init();
+    DF.trauma = 0.8f; /* high trauma */
+    dario_ingest(5);
+    float logits[64];
+    float orig[64];
+    for (int i = 0; i < 64; i++) logits[i] = orig[i] = 0.0f;
+    apply_field_to_logits(logits, 64);
+    /* trauma term boosts tokens i < 50 with decreasing strength */
+    ASSERT_TRUE(logits[0] > orig[0], "trauma should boost token 0");
+    ASSERT_TRUE(logits[0] > logits[49], "trauma boost should decrease with index");
+    PASS();
+}
+
+static void test_dario_step_increments(void) {
+    TEST(dario_step_increments);
+    dario_field_init();
+    field_init();
+    ASSERT_TRUE(DF.dstep == 0, "dstep should be 0 after init");
+    dario_ingest(1);
+    ASSERT_TRUE(DF.dstep == 1, "dstep should be 1 after one ingest");
+    dario_ingest(2);
+    dario_ingest(3);
+    ASSERT_TRUE(DF.dstep == 3, "dstep should be 3 after three ingests");
     PASS();
 }
 
@@ -1192,11 +1522,39 @@ int main(void) {
     test_prophecy_debt_edge_cases();
 
     /* Field → logits */
-    printf("\n[field_logits]\n");
-    test_apply_destiny();
-    test_apply_destiny_zero_bias();
-    test_apply_suffering();
-    test_apply_attention();
+    /* Dario Equation */
+    printf("\n[dario_field]\n");
+    test_dario_field_init();
+    test_dario_clampf();
+    test_dario_embed_deterministic();
+    test_dario_embed_normalized();
+    test_dario_embed_different_ids();
+    test_dario_embed_null_oob();
+    test_dario_cosine_self();
+    test_dario_cosine_different();
+    test_dario_cooc_update_new();
+    test_dario_cooc_update_existing();
+    test_dario_prophecy_add();
+    test_dario_prophecy_overflow();
+    test_dario_prophecy_update_fulfills();
+    test_dario_prophecy_update_old_expire();
+    test_dario_ingest_builds_context();
+    test_dario_ingest_context_overflow();
+    test_dario_ingest_updates_destiny();
+    test_dario_ingest_creates_cooc();
+    test_dario_ingest_creates_prophecy();
+    test_dario_ingest_trauma_from_dissonance();
+    test_dario_ingest_no_trauma_low_dissonance();
+    test_dario_chamber_update_baseline();
+    test_dario_chamber_fear_from_dissonance();
+    test_dario_chamber_love_from_resonance();
+    test_dario_chamber_modulates_coefficients();
+    test_dario_chamber_tau_mod_range();
+    test_dario_apply_field_to_logits_additive();
+    test_dario_apply_field_to_logits_empty();
+    test_dario_apply_field_to_logits_zero_n();
+    test_dario_trauma_boosts_low_tokens();
+    test_dario_step_increments();
 
     /* Harmonic resonance */
     printf("\n[harmonic]\n");

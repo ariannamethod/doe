@@ -8,7 +8,7 @@
  * θ = ε + γ + αδ
  *   ε = indexed weights (read-only substrate)
  *   γ = LoRA personality (living experts, Hebbian-trained via NOTORCH)
- *   δ = physics (prophecy, suffering, destiny, Schumann resonance)
+ *   δ = physics (Dario Equation: H+F+A+T, Kuramoto chambers, Schumann resonance)
  *   α = injection strength (learned per-layer)
  *
  * each forward pass, the parliament decides:
@@ -244,6 +244,246 @@ typedef struct {
 static FieldState F;
 static FieldMLP   F_mlp;
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DARIO FIELD — the equation overlay on transformer logits.
+ *
+ * p(x|Φ) = transformer_logits + α_mod·α·H + β_mod·β·F_p + γ_mod·γ·A + T
+ *
+ * H  = Hebbian resonance (co-occurrence memory beyond KV cache window)
+ * F_p = Prophecy fulfillment (unfulfilled predictions create generation pressure)
+ * A  = Destiny attraction (EMA of semantic direction)
+ * T  = Trauma gravity (origin tokens surface when field is hurt)
+ *
+ * B (bigrams) intentionally omitted — the transformer IS the sequential chain.
+ *
+ * Six emotional chambers (Kuramoto-coupled somatic markers) modulate
+ * every coefficient: α_mod, β_mod, γ_mod, τ_mod.
+ *
+ * This replaces the ad-hoc apply_destiny/apply_suffering/apply_attention
+ * with a single coherent equation. The transformer speaks. The field listens.
+ * What emerges is neither.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Dario equation coefficients for DoE (lighter than standalone dario.c) */
+#define DARIO_ALPHA     0.15f   /* Hebbian weight (lighter — transformer does heavy lifting) */
+#define DARIO_BETA      0.10f   /* Prophecy weight */
+#define DARIO_GAMMA     0.12f   /* Destiny weight */
+#define DARIO_DIM       32      /* embedding dimension for field (smaller than host) */
+
+/* Co-occurrence field (sparse, token-level) */
+#define DARIO_MAX_COOC  32768
+#define DARIO_MAX_CTX   64
+#define DARIO_MAX_PROPH 16
+
+/* Emotional chambers */
+enum { DCH_FEAR=0, DCH_LOVE, DCH_RAGE, DCH_VOID, DCH_FLOW, DCH_COMPLEX, DARIO_NUM_CH };
+
+typedef struct {
+    int target; float strength; int age; int fulfilled;
+} DarioProphecy;
+
+typedef struct {
+    /* Co-occurrence field (Hebbian: long-range memory beyond KV cache) */
+    int   cooc_src[DARIO_MAX_COOC];
+    int   cooc_dst[DARIO_MAX_COOC];
+    float cooc_val[DARIO_MAX_COOC];
+    int   cooc_n;
+
+    /* Context window (recent token IDs for Hebbian lookup) */
+    int   context[DARIO_MAX_CTX];
+    int   ctx_len;
+
+    /* Prophecy system (active predictions creating pressure) */
+    DarioProphecy prophecy[DARIO_MAX_PROPH];
+    int   prophecy_n;
+
+    /* Destiny vector (EMA of token embeddings — semantic direction) */
+    float destiny[DARIO_DIM];
+    float dest_magnitude;
+
+    /* Dario coefficients (drift with field state) */
+    float alpha, beta, gamma_d;
+
+    /* Emotional chambers (Kuramoto-coupled) */
+    float chamber[DARIO_NUM_CH];
+    float alpha_mod, beta_mod, gamma_mod, tau_mod;
+
+    /* Token embeddings (hash-based, lazy init) */
+    float embeds[2048][DARIO_DIM];  /* max 2048 tokens tracked */
+    int   embed_init[2048];
+
+    /* Trauma level */
+    float trauma;
+
+    /* Step counter */
+    int   dstep;
+} DarioField;
+
+static DarioField DF;
+
+/* ── Dario field helpers ── */
+
+static float dario_clampf(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+static float *dario_get_embed(int id) {
+    if (id < 0 || id >= 2048) return NULL;
+    if (!DF.embed_init[id]) {
+        uint32_t h = 2166136261u;
+        for (int i = 0; i < 4; i++) { h ^= (id >> (i*8)) & 0xFF; h *= 16777619u; }
+        for (int d = 0; d < DARIO_DIM; d++) {
+            h = h * 1103515245 + 12345;
+            DF.embeds[id][d] = ((float)(h & 0x7FFFFFFF) / (float)0x7FFFFFFF - 0.5f) * 0.1f;
+        }
+        /* normalize */
+        float norm = 0;
+        for (int d = 0; d < DARIO_DIM; d++) norm += DF.embeds[id][d] * DF.embeds[id][d];
+        norm = sqrtf(norm + 1e-12f);
+        for (int d = 0; d < DARIO_DIM; d++) DF.embeds[id][d] /= norm;
+        DF.embed_init[id] = 1;
+    }
+    return DF.embeds[id];
+}
+
+static float dario_cosine(const float *a, const float *b) {
+    float dot = 0, na = 0, nb = 0;
+    for (int i = 0; i < DARIO_DIM; i++) {
+        dot += a[i] * b[i]; na += a[i]*a[i]; nb += b[i]*b[i];
+    }
+    return dot / (sqrtf(na) * sqrtf(nb) + 1e-12f);
+}
+
+static void dario_cooc_update(int src, int dst, float delta) {
+    for (int i = 0; i < DF.cooc_n; i++)
+        if (DF.cooc_src[i] == src && DF.cooc_dst[i] == dst) {
+            DF.cooc_val[i] += delta; return;
+        }
+    if (DF.cooc_n >= DARIO_MAX_COOC) return;
+    int i = DF.cooc_n++;
+    DF.cooc_src[i] = src; DF.cooc_dst[i] = dst; DF.cooc_val[i] = delta;
+}
+
+static void dario_prophecy_add(int target, float strength) {
+    if (DF.prophecy_n >= DARIO_MAX_PROPH) {
+        int oldest = 0;
+        for (int i = 1; i < DF.prophecy_n; i++)
+            if (DF.prophecy[i].age > DF.prophecy[oldest].age) oldest = i;
+        DF.prophecy[oldest] = DF.prophecy[--DF.prophecy_n];
+    }
+    DF.prophecy[DF.prophecy_n++] = (DarioProphecy){target, strength, 0, 0};
+}
+
+static void dario_prophecy_update(int token) {
+    for (int i = 0; i < DF.prophecy_n; i++) {
+        if (DF.prophecy[i].target == token) DF.prophecy[i].fulfilled = 1;
+        DF.prophecy[i].age++;
+    }
+    int w = 0;
+    for (int i = 0; i < DF.prophecy_n; i++)
+        if (!DF.prophecy[i].fulfilled && DF.prophecy[i].age < 50)
+            DF.prophecy[w++] = DF.prophecy[i];
+    DF.prophecy_n = w;
+}
+
+/* ── Dario field init ── */
+static void dario_field_init(void) {
+    memset(&DF, 0, sizeof(DF));
+    DF.alpha = DARIO_ALPHA;
+    DF.beta = DARIO_BETA;
+    DF.gamma_d = DARIO_GAMMA;
+    DF.alpha_mod = 1.0f;
+    DF.beta_mod = 1.0f;
+    DF.gamma_mod = 1.0f;
+    DF.tau_mod = 1.0f;
+}
+
+/* ── Emotional chambers update (Kuramoto-coupled somatic markers) ── */
+static void dario_chamber_update(void) {
+    float *C = DF.chamber;
+
+    /* excitation from field state */
+    if (F.dissonance > 0.7f) C[DCH_FEAR] += 0.05f * F.dissonance;
+    if (F.resonance > 0.7f)  C[DCH_LOVE] += 0.04f * F.resonance;
+    if (DF.trauma > 0.5f && F.dissonance > 0.5f)
+        C[DCH_RAGE] += 0.06f * DF.trauma;
+    if (F.entropy > 0.7f)    C[DCH_VOID] += 0.03f * F.entropy;
+    if (F.emergence > 0.5f)  C[DCH_FLOW] += 0.05f * F.emergence;
+    C[DCH_COMPLEX] += 0.04f * fabsf(C[DCH_LOVE] - C[DCH_RAGE])
+                    * (C[DCH_LOVE] > 0.2f && C[DCH_RAGE] > 0.2f ? 1.0f : 0.0f);
+
+    /* Kuramoto coupling */
+    float K = 0.02f;
+    float old[DARIO_NUM_CH];
+    memcpy(old, C, sizeof(old));
+    for (int i = 0; i < DARIO_NUM_CH; i++)
+        for (int j = 0; j < DARIO_NUM_CH; j++)
+            if (i != j) C[i] += K * sinf(old[j] - old[i]);
+
+    /* decay */
+    float decay[] = { 0.95f, 0.95f, 0.93f, 0.96f, 0.94f, 0.97f };
+    for (int i = 0; i < DARIO_NUM_CH; i++)
+        C[i] = dario_clampf(C[i] * decay[i], 0.0f, 1.0f);
+
+    /* somatic markers → coefficient modulation */
+    DF.alpha_mod = dario_clampf(1.0f + 0.3f * C[DCH_LOVE] - 0.2f * C[DCH_RAGE]
+                                     + 0.1f * C[DCH_FLOW], 0.5f, 2.0f);
+    DF.beta_mod  = dario_clampf(1.0f + 0.2f * C[DCH_FLOW] - 0.3f * C[DCH_FEAR],
+                                0.5f, 2.0f);
+    DF.gamma_mod = dario_clampf(1.0f + 0.4f * C[DCH_VOID] + 0.2f * C[DCH_COMPLEX]
+                                     - 0.1f * C[DCH_LOVE], 0.5f, 2.0f);
+    DF.tau_mod   = dario_clampf(1.0f + 0.5f * C[DCH_FLOW] - 0.3f * C[DCH_FEAR],
+                                0.5f, 2.0f);
+}
+
+/* ── Dario ingest: learn from generated token ── */
+static void dario_ingest(int token_id) {
+    if (token_id < 0) return;
+    int tid = token_id % 2048; /* wrap for embedding table */
+
+    /* co-occurrence with recent context */
+    for (int c = 0; c < DF.ctx_len; c++) {
+        float w = 1.0f / (float)(DF.ctx_len - c);
+        dario_cooc_update(DF.context[c], tid, w * 0.3f);
+    }
+
+    /* prophecy update */
+    dario_prophecy_update(tid);
+
+    /* prophecy: predict next based on strongest co-occurrence */
+    float best_cooc = -1; int best_pred = -1;
+    for (int i = 0; i < DF.cooc_n; i++)
+        if (DF.cooc_src[i] == tid && DF.cooc_val[i] > best_cooc) {
+            best_cooc = DF.cooc_val[i]; best_pred = DF.cooc_dst[i];
+        }
+    if (best_pred >= 0) dario_prophecy_add(best_pred, 0.3f);
+
+    /* destiny: EMA of token embeddings */
+    float *e = dario_get_embed(tid);
+    if (e) {
+        for (int d = 0; d < DARIO_DIM; d++)
+            DF.destiny[d] = 0.1f * e[d] + 0.9f * DF.destiny[d];
+        float norm = 0;
+        for (int d = 0; d < DARIO_DIM; d++) norm += DF.destiny[d] * DF.destiny[d];
+        DF.dest_magnitude = sqrtf(norm + 1e-12f);
+    }
+
+    /* update context window */
+    if (DF.ctx_len < DARIO_MAX_CTX)
+        DF.context[DF.ctx_len++] = tid;
+    else {
+        memmove(DF.context, DF.context + 1, (DARIO_MAX_CTX - 1) * sizeof(int));
+        DF.context[DARIO_MAX_CTX - 1] = tid;
+    }
+
+    /* trauma from dissonance */
+    if (F.dissonance > 0.7f)
+        DF.trauma = dario_clampf(DF.trauma + F.dissonance * 0.05f, 0, 1);
+    DF.trauma *= 0.97f;
+
+    DF.dstep++;
+}
+
 /* Schumann harmonics */
 static const float g_schumann_harmonics[SCHUMANN_N_HARMONICS] = {
     7.83f, 14.1f, 20.3f, 26.4f, 32.5f
@@ -341,8 +581,11 @@ static void field_init(void) {
     F.expert_precise = 0.25f;
     calendar_init();
     field_mlp_init();
+    dario_field_init();
     printf("[doe] θ = ε + γ + αδ — parliament awakens. prophecy=%d destiny=%.2f\n",
            F.prophecy, F.destiny);
+    printf("[doe] dario equation active: H(hebbian) + F(prophecy) + A(destiny) + T(trauma)\n");
+    printf("[doe] 6 chambers: fear/love/rage/void/flow/complex (Kuramoto K=0.02)\n");
 }
 
 /* ─── Schumann resonance ─── */
@@ -538,52 +781,117 @@ static float compute_prophecy_debt(const float *logits, int chosen, int n) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * FIELD → LOGITS — the full pipeline. from AML am_apply_field_to_logits().
+ * FIELD → LOGITS — Dario Equation overlay on transformer logits.
  *
- * 1. destiny bias: suppress low-probability tokens
- * 2. suffering: compress toward mean (pain dampens extremes)
- * 3. attention: sharpen or blur distribution
- * 4. laws: entropy floor, resonance ceiling
+ * p(x|Φ) = softmax(logits + α·H + β·F + γ·A + T) / τ
  *
- * this is not post-processing. this is the architecture speaking.
+ * H = Hebbian co-occurrence (long-range memory beyond KV window)
+ * F = Prophecy fulfillment (unfulfilled predictions create pressure)
+ * A = Destiny attraction (conversation mass pulls toward attractor)
+ * T = Trauma gravity (origin tokens surface when field is wounded)
+ *
+ * Coefficients modulated by 6 Kuramoto-coupled emotional chambers.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-static void apply_destiny(float *logits, int n) {
-    if (n <= 0 || F.destiny_bias < 0.001f) return;
-    float mx = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > mx) mx = logits[i];
-    for (int i = 0; i < n; i++) {
-        float diff = mx - logits[i];
-        logits[i] -= diff * F.destiny_bias * 0.5f;
-    }
-}
-
-static void apply_suffering(float *logits, int n) {
-    if (n <= 0) return;
-    float total = F.pain + F.tension * 0.5f;
-    if (total < 0.01f) return;
-    float mean = 0;
-    for (int i = 0; i < n; i++) mean += logits[i];
-    mean /= n;
-    float compress = total * 0.3f;
-    for (int i = 0; i < n; i++) logits[i] = logits[i] * (1.0f - compress) + mean * compress;
-}
-
-static void apply_attention(float *logits, int n) {
-    if (n <= 0) return;
-    float focus = F.attend_focus;
-    if (focus < 0.01f) return;
-    float mx = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > mx) mx = logits[i];
-    for (int i = 0; i < n; i++) {
-        float d = mx - logits[i];
-        logits[i] -= d * focus * 0.2f;
-    }
-}
-
 static void apply_field_to_logits(float *logits, int n) {
-    apply_destiny(logits, n);
-    apply_suffering(logits, n);
-    apply_attention(logits, n);
+    if (n <= 0) return;
+
+    /* ── Emotional chambers update ── */
+    dario_chamber_update();
+
+    /* ── Effective coefficients (somatic-modulated) ── */
+    float eff_alpha = DF.alpha_mod * DF.alpha;
+    float eff_beta  = DF.beta_mod * DF.beta;
+    float eff_gamma = DF.gamma_mod * DF.gamma_d;
+
+    /* boost gamma when trauma is active */
+    if (DF.trauma > 0.3f) eff_gamma += DF.trauma * 0.8f;
+
+    /* ── H: Hebbian Resonance (co-occurrence beyond KV cache) ── */
+    /* last 8 context tokens drive the Hebbian signal */
+    int ctx_start = (DF.ctx_len > 8) ? DF.ctx_len - 8 : 0;
+    float h_max = 0;
+
+    /* allocate scratch for H, F_p, A, T signals (on stack if n < 8192) */
+    float *H_sig = calloc(n, sizeof(float));
+    float *F_sig = calloc(n, sizeof(float));
+    float *A_sig = calloc(n, sizeof(float));
+
+    for (int c = ctx_start; c < DF.ctx_len; c++) {
+        int ctx_id = DF.context[c];
+        float decay = powf(0.9f, (float)(DF.ctx_len - 1 - c));
+        for (int i = 0; i < DF.cooc_n; i++) {
+            if (DF.cooc_src[i] == ctx_id) {
+                int dst = DF.cooc_dst[i];
+                /* map co-occurrence dst back to vocab range */
+                if (dst < n)
+                    H_sig[dst] += DF.cooc_val[i] * decay;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) if (H_sig[i] > h_max) h_max = H_sig[i];
+    if (h_max > 1e-6f) for (int i = 0; i < n; i++) H_sig[i] /= h_max;
+
+    /* ── F: Prophecy Fulfillment (unfulfilled predictions create pressure) ── */
+    float f_max = 0;
+    for (int i = 0; i < n && i < 2048; i++) {
+        float *te = dario_get_embed(i);
+        if (!te) continue;
+        float score = 0;
+        for (int p = 0; p < DF.prophecy_n; p++) {
+            DarioProphecy *pr = &DF.prophecy[p];
+            if (pr->fulfilled) continue;
+            float *pe = dario_get_embed(pr->target);
+            if (!pe) continue;
+            float sim = dario_cosine(te, pe);
+            if (sim < 0) sim = 0;
+            float debt = logf(1.0f + (float)pr->age);
+            score += pr->strength * sim * debt;
+        }
+        F_sig[i] = score;
+    }
+    for (int i = 0; i < n; i++) if (F_sig[i] > f_max) f_max = F_sig[i];
+    if (f_max > 1e-6f) for (int i = 0; i < n; i++) F_sig[i] /= f_max;
+
+    /* ── A: Destiny Attraction (EMA semantic direction) ── */
+    if (DF.dest_magnitude > 1e-6f) {
+        float a_max = 0;
+        for (int i = 0; i < n && i < 2048; i++) {
+            float *te = dario_get_embed(i);
+            if (te) A_sig[i] = dario_cosine(te, DF.destiny) * DF.dest_magnitude;
+        }
+        for (int i = 0; i < n; i++)
+            if (fabsf(A_sig[i]) > a_max) a_max = fabsf(A_sig[i]);
+        if (a_max > 1e-6f) for (int i = 0; i < n; i++) A_sig[i] /= a_max;
+    }
+
+    /* ── Combine: THE DARIO EQUATION (additive overlay on transformer logits) ──
+     *
+     * logits[i] += α_mod·α·H[i] + β_mod·β·F[i] + γ_mod·γ·A[i] + T[i]
+     *
+     * The transformer provides the base distribution.
+     * The equation provides the field memory.
+     * Neither dominates. Emergence at the boundary.
+     */
+    float t_boost = (DF.trauma > 0.3f) ? DF.trauma * 2.0f : 0;
+    float gate = 1.0f / (1.0f + expf(-(F.resonance - 0.5f) * 4.0f));
+    float h_gate = gate * 2.0f;
+    float f_gate = gate * 1.5f;
+    float h_gated_sig = 1.0f / (1.0f + expf(-h_gate));
+    float f_gated_sig = 1.0f / (1.0f + expf(-f_gate));
+
+    for (int i = 0; i < n; i++) {
+        float h_term = eff_alpha * H_sig[i] * h_gated_sig;
+        float f_term = eff_beta  * F_sig[i] * f_gated_sig;
+        float a_term = eff_gamma * A_sig[i];
+        float t_term = (i < 50) ? t_boost * (1.0f - (float)i / 50.0f) : 0;
+
+        logits[i] += h_term + f_term + a_term + t_term;
+    }
+
+    /* tau_mod feeds into effective temperature (applied in field_step) */
+    F.effective_temp *= DF.tau_mod;
+
+    free(H_sig); free(F_sig); free(A_sig);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -2548,8 +2856,10 @@ static void chat(GGUFIndex *ps) {
         n_input += tokenize_input(ps, wrapped, input_tokens + n_input, 512 - n_input);
 
         int pos = 0;
-        for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++)
+        for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
             doe_forward(ps, &is, input_tokens[i], pos);
+            dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
+        }
 
         int prev = input_tokens[n_input - 1];
         printf("  ");
@@ -2558,7 +2868,7 @@ static void chat(GGUFIndex *ps) {
         for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
             float *lg = doe_forward(ps, &is, prev, pos);
 
-            /* Field modulation on logits */
+            /* Field modulation on logits — Dario Equation */
             field_step(1.0f);
             apply_field_to_logits(lg, ps->host_vocab);
 
@@ -2579,6 +2889,9 @@ static void chat(GGUFIndex *ps) {
             float pd = compute_prophecy_debt(lg, next, ps->host_vocab);
             F.debt += pd;
             debt_sum += pd; debt_count++;
+
+            /* Dario field: ingest generated token (co-occurrence + prophecy + destiny) */
+            dario_ingest(next);
 
             /* NOTORCH Hebbian update — debt drives learning */
             float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
@@ -2805,8 +3118,10 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
 
     /* Prefill */
     int pos = 0;
-    for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++)
+    for (int i = 0; i < n_input && pos < max_seq - 1; i++, pos++) {
         doe_forward(ps, &is, input_tokens[i], pos);
+        dario_ingest(input_tokens[i]); /* feed user tokens into Dario field */
+    }
 
     int prev = input_tokens[n_input - 1];
 
@@ -2832,6 +3147,10 @@ static void http_stream_inference(int fd, GGUFIndex *ps, const char *user_msg, f
         /* Prophecy debt + Hebbian update */
         float pd = compute_prophecy_debt(lg, next, ps->host_vocab);
         F.debt += pd;
+
+        /* Dario field: ingest generated token */
+        dario_ingest(next);
+
         float learn_signal = pd > 0.3f ? -pd : (1.0f - pd) * 0.1f;
         for (int l = 0; l < ps->n_field_layers; l++) {
             FieldLayer *fl = &ps->field_layers[l];

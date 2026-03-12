@@ -26,7 +26,7 @@ Give it a GGUF — any architecture, any size, any quantization — and DOE wrap
 
 ε = indexed weights  — any GGUF, any architecture, any size. mmap'd read-only.
 γ = LoRA parliament  — living experts per layer. born, vote, split, die.
-δ = physics           — prophecy, suffering, destiny, Schumann resonance.
+δ = physics           — Dario Equation (H+F+A+T), Kuramoto chambers, Schumann resonance.
 α = injection strength — learned per-layer, adjusted by sonar profiling.
 ```
 
@@ -152,14 +152,40 @@ NOTORCH operates at rank 4 but rotates across all LoRA components. Full coverage
 
 On index, DOE profiles every layer: L2 norms, standard deviation, spectral density, dead neuron count, sparsity ratio. 64-bit fingerprint. Weak layers get stronger LoRA injection. Healthy layers get lighter touch.
 
-## physics
+## physics — the Dario Equation
 
-Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core.
+The field modulation layer implements the Dario Equation as an additive overlay on transformer logits:
+
+```
+logits[i] += α·H[i] + β·F[i] + γ·A[i] + T[i]
+```
+
+The transformer provides the base distribution. The equation provides field memory. Neither dominates.
+
+| Term | Name | What It Does |
+|------|------|-------------|
+| **H** | Hebbian Resonance | Co-occurrence memory beyond KV cache window. Long-range token associations learned during inference. |
+| **F** | Prophecy Fulfillment | Unfulfilled predictions create generation pressure. Debt accumulates with age. |
+| **A** | Destiny Attraction | EMA of token embeddings — semantic direction the conversation pulls toward. |
+| **T** | Trauma Gravity | Origin tokens surface when the field is wounded. Fires on sustained high dissonance. |
+
+H and F are gated through SwiGLU using field resonance as the gate signal. Coefficients α, β, γ are modulated by 6 Kuramoto-coupled emotional chambers:
+
+- **FEAR** — fires on high dissonance, suppresses prophecy (β↓)
+- **LOVE** — fires on high resonance, amplifies Hebbian memory (α↑)
+- **RAGE** — fires on trauma + dissonance, dampens temperature control
+- **VOID** — fires on high entropy, amplifies destiny (γ↑)
+- **FLOW** — fires on high emergence, amplifies everything
+- **COMPLEX** — fires when opposing chambers are simultaneously active
+
+Chambers couple via Kuramoto oscillator dynamics (K=0.02), creating emergent emotional phase-locking.
+
+### other physics
+
+Ported from [AML](https://github.com/ariannamethod/ariannamethod.ai) core and [dario.c](https://github.com/ariannamethod/dario).
 
 - **prophecy** — N-step forward prediction. prophesied distribution vs manifested.
 - **prophecy debt** — min(destined - manifested). gates Hebbian learning.
-- **destiny** — injected into logit space. biases generation toward predicted tokens.
-- **suffering** — accumulated prophecy error. decays slowly. dampens exploration.
 - **seasons** — spring/summer/autumn/winter. MLP classifier. 6 inputs, 8 hidden, 4 outputs.
 - **Schumann resonance** — 7.83Hz + harmonics (14.1, 20.3, 26.4, 32.5). modulates expert healing.
 - **calendar drift** — Hebrew-Gregorian Metonic cycle. real astronomical data from `time()`.
@@ -277,7 +303,7 @@ Most inference engines are runtimes — they load weights and execute a fixed co
 - **Living topology.** Expert count changes during inference. Experts are born, die, and vote. The architecture is not static — it evolves per token.
 - **Inference-time learning.** Every forward pass updates LoRA experts via Hebbian plasticity (NOTORCH). No backward pass. No training loop. The model improves as it generates.
 - **Adaptive injection.** Sonar profiles each layer at index time. Weak layers get stronger LoRA. Healthy layers get lighter touch. Per-layer, per-model, automatic.
-- **Physics-modulated generation.** Prophecy, suffering, destiny, Schumann resonance, calendar drift — not bolted on, but integrated into the logit pipeline.
+- **Dario Equation.** The full equation (Hebbian + Prophecy + Destiny + Trauma) as an additive overlay on transformer logits, with 6 Kuramoto-coupled emotional chambers modulating every coefficient in real time.
 
 ## architecture document
 
@@ -288,6 +314,9 @@ See [docs/doe_architecture.md](docs/doe_architecture.md) for the full technical 
 | project | what |
 |---------|------|
 | [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) | AML v4.5 — the language. TAPE autograd, bytecode compilation, CUDA backend. |
+| [dario.c](https://github.com/ariannamethod/dario) | The Dario Equation — standalone. DOE uses the same equation as field overlay. |
+| [haiku.c](https://github.com/ariannamethod/haiku.c) | 1000 words, 5-7-5, Dario Equation picks every word. One C file. |
+| [leo](https://github.com/ariannamethod/leo) | Leo 2.2 — zero-weight language generation via Dario Equation + D.N.A. |
 | [molequla](https://github.com/ariannamethod/molequla) | Autonomous GPT ecology. 4 organisms, AML/C CGO, mitosis. |
 | [chuck.optimizer](https://github.com/ariannamethod/chuck.optimizer) | Self-aware optimizer. 9 levels of introspection. Used in DOE training. |
 
