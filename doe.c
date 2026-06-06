@@ -1092,6 +1092,150 @@ static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #endif
 }
 
+/* ── packed quantized matvec — vendored from notorch nt_qmatvec ──────────────────
+ * Keeps weights PACKED in RAM and dequantizes each block inline (no f32 blow-up).
+ * DoE stays a single file. dtype = GGUF code (1 f16, 2 Q4_0, 6 Q5_0, 8 Q8_0,
+ * 12 Q4_K, 14 Q6_K). Row kernels take [r0,r1) so they thread like matvec.
+ * Verified faithful to notorch (rel ~1e-6 vs dequant->cblas). reuses f16_to_f32. */
+static void pq_f16_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    const uint16_t *Wh = (const uint16_t*)W;
+    for (int row=r0; row<r1; row++) { const uint16_t *r = Wh + (size_t)row*c;
+        float a=0; for (int j=0;j<c;j++) a += f16_to_f32(r[j])*x[j]; out[row]=a; }
+}
+static void pq_q4_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const float *xb=x+(size_t)b*32;
+            for (int i=0;i<16;i++) { int lo=(int)(bl[2+i]&0x0F)-8, hi=(int)(bl[2+i]>>4)-8;
+                a += d*lo*xb[i]; a += d*hi*xb[i+16]; } }
+        out[row]=a; }
+}
+static void pq_q8_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const float *xb=x+(size_t)b*32;
+            for (int i=0;i<32;i++) a += d*(float)(int8_t)bl[2+i]*xb[i]; }
+        out[row]=a; }
+}
+static void pq_q5_0_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*22; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*22; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            uint32_t qh=(uint32_t)bl[2]|((uint32_t)bl[3]<<8)|((uint32_t)bl[4]<<16)|((uint32_t)bl[5]<<24);
+            const uint8_t *qs=bl+6; const float *xb=x+(size_t)b*32;
+            for (int j=0;j<16;j++) { int lo=qs[j]&0x0F, hi=qs[j]>>4; int h0=(qh>>j)&1, h1=(qh>>(j+16))&1;
+                a += d*(float)((lo|(h0<<4))-16)*xb[j]; a += d*(float)((hi|(h1<<4))-16)*xb[j+16]; } }
+        out[row]=a; }
+}
+static void pq_smk4(int j, const uint8_t *sc, uint8_t *s, uint8_t *m) {
+    if (j<4) { *s=sc[j]&63; *m=sc[j+4]&63; }
+    else { *s=(sc[j+4]&0x0F)|((sc[j-4]>>6)<<4); *m=(sc[j+4]>>4)|((sc[j]>>6)<<4); }
+}
+static void pq_q4_k_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/256;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*144; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*144;
+            float d=f16_to_f32(bl[0]|(bl[1]<<8)), dmin=f16_to_f32(bl[2]|(bl[3]<<8));
+            const uint8_t *sc=bl+4,*qs=bl+16; const float *xb=x+(size_t)b*256; int is=0,qi=0;
+            for (int j=0;j<256;j+=64) { uint8_t s0,m0,s1,m1; pq_smk4(is,sc,&s0,&m0); pq_smk4(is+1,sc,&s1,&m1);
+                float d1=d*s0,mm1=dmin*m0,d2=d*s1,mm2=dmin*m1;
+                for (int l=0;l<32;l++) a += (d1*(float)(qs[qi+l]&0x0F)-mm1)*xb[j+l];
+                for (int l=0;l<32;l++) a += (d2*(float)(qs[qi+l]>>4)-mm2)*xb[j+32+l];
+                qi+=32; is+=2; } }
+        out[row]=a; }
+}
+static void pq_q6_k_rows(float *out, const uint8_t *W, const float *x, int r0, int r1, int c) {
+    int nb=c/256;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*210; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*210, *ql=bl, *qh=bl+128;
+            const int8_t *sc=(const int8_t*)(bl+192); float d=f16_to_f32(bl[208]|(bl[209]<<8));
+            const float *xb=x+(size_t)b*256;
+            for (int n=0;n<256;n+=128) { const uint8_t *qlh=ql+(n/128)*64,*qhh=qh+(n/128)*32; const int8_t *sch=sc+(n/128)*8;
+                for (int l=0;l<32;l++) { int is=l/16;
+                    int q1=(int)((qlh[l]&0x0F)|(((qhh[l]>>0)&3)<<4))-32, q2=(int)((qlh[l+32]&0x0F)|(((qhh[l]>>2)&3)<<4))-32;
+                    int q3=(int)((qlh[l]>>4)|(((qhh[l]>>4)&3)<<4))-32, q4=(int)((qlh[l+32]>>4)|(((qhh[l]>>6)&3)<<4))-32;
+                    a += d*sch[is+0]*q1*xb[n+l]; a += d*sch[is+2]*q2*xb[n+l+32];
+                    a += d*sch[is+4]*q3*xb[n+l+64]; a += d*sch[is+6]*q4*xb[n+l+96]; } } }
+        out[row]=a; }
+}
+
+typedef void (*pq_fn)(float*, const uint8_t*, const float*, int, int, int);
+static pq_fn pq_for(int dt, int c) {
+    switch (dt) {
+        case 1:  return pq_f16_rows;
+        case 2:  return (c%32)?NULL:pq_q4_0_rows;
+        case 6:  return (c%32)?NULL:pq_q5_0_rows;
+        case 8:  return (c%32)?NULL:pq_q8_0_rows;
+        case 12: return (c%256)?NULL:pq_q4_k_rows;
+        case 14: return (c%256)?NULL:pq_q6_k_rows;
+    }
+    return NULL;
+}
+typedef struct { pq_fn fn; float *out; const uint8_t *Wq; const float *x; int r0,r1,c; } PQWork;
+static void *pq_worker(void *arg) { PQWork *w=(PQWork*)arg; w->fn(w->out,w->Wq,w->x,w->r0,w->r1,w->c); return NULL; }
+
+/* out[r] = Wq[r,c] @ x[c], weights packed. Returns 0 ok, -1 if dtype unsupported. */
+static int doe_qmatvec(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
+    pq_fn fn = pq_for(dt, c);
+    if (!fn) return -1;
+    int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
+    if (nt <= 1 || (long)r*c < (1L<<20)) { fn(out, Wq, x, 0, r, c); return 0; }
+    pthread_t thr[32]; PQWork work[32]; int chunk=(r+nt-1)/nt, actual=0;
+    for (int t=0;t<nt;t++) { int r0=t*chunk, r1=r0+chunk; if (r0>=r) break; if (r1>r) r1=r;
+        work[t]=(PQWork){fn,out,Wq,x,r0,r1,c}; pthread_create(&thr[t],NULL,pq_worker,&work[t]); actual++; }
+    for (int t=0;t<actual;t++) pthread_join(thr[t],NULL);
+    return 0;
+}
+
+/* int8 dynamic-activation-quant fast path (Q4_0), NEON SDOT / scalar. APPROXIMATE. */
+static void pq_quant_act_q8(const float *x, int c, int8_t *qa, float *da) {
+    int nb=c/32;
+    for (int b=0;b<nb;b++) { const float *xb=x+(size_t)b*32; float amax=0;
+        for (int i=0;i<32;i++){ float v=fabsf(xb[i]); if(v>amax)amax=v; }
+        float d=amax/127.0f, id=(d>0)?1.0f/d:0.0f; da[b]=d;
+        for (int i=0;i<32;i++){ int q=(int)lrintf(xb[i]*id); if(q>127)q=127; else if(q<-127)q=-127; qa[(size_t)b*32+i]=(int8_t)q; } }
+}
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32; const uint8x16_t m0f=vdupq_n_u8(0x0F); const int8x16_t e8=vdupq_n_s8(8);
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *qab=qa+(size_t)b*32; uint8x16_t pk=vld1q_u8(bl+2);
+            int8x16_t lo=vsubq_s8(vreinterpretq_s8_u8(vandq_u8(pk,m0f)),e8), hi=vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),e8);
+            int32x4_t s=vdupq_n_s32(0); s=vdotq_s32(s,lo,vld1q_s8(qab)); s=vdotq_s32(s,hi,vld1q_s8(qab+16));
+            a += d*da[b]*(float)vaddvq_s32(s); }
+        out[row]=a; }
+}
+#else
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *qab=qa+(size_t)b*32; int32_t s=0;
+            for (int i=0;i<16;i++){ int lo=(int)(bl[2+i]&0x0F)-8, hi=(int)(bl[2+i]>>4)-8; s+=lo*qab[i]; s+=hi*qab[i+16]; }
+            a += d*da[b]*(float)s; }
+        out[row]=a; }
+}
+#endif
+static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
+    if (dt != 2 || (c%32)) return -1;
+    int nb=c/32; int8_t *qa=(int8_t*)malloc((size_t)c); float *da=(float*)malloc((size_t)nb*sizeof(float));
+    if (!qa || !da) { free(qa); free(da); return -1; }
+    pq_quant_act_q8(x, c, qa, da);
+    pq_q4_0_rows_i8(out, Wq, qa, da, 0, r, c);
+    free(qa); free(da); return 0;
+}
+
+/* matvec dispatch: packed weight (dt != 0) -> doe_qmatvec (inline dequant);
+ * else the existing f32 matvec. The one call the forward uses for host weights. */
+static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
+    if (dt && doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+    matvec(out, W, x, r, c);
+}
+
 static void softmax_n(float *x, int n) {
     float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
     float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-mx); s += x[i]; }
@@ -1286,6 +1430,7 @@ typedef struct {
     float *host_tok_emb;
     float *host_output;
     float *host_norm;
+    int   host_output_dt;    /* packed GGUF dtype of host_output (0 = f32 / tied) */
     float    rope_theta;     /* RoPE frequency base (default 10000, Qwen=1000000) */
     float    rms_norm_eps;   /* RMSNorm epsilon (default 1e-5, varies per arch) */
     struct {
@@ -1294,6 +1439,8 @@ typedef struct {
         float *ffn_gate, *ffn_up, *ffn_down;
         float *ffn_gate_up;  /* fused gate+up for Phi-3 (size: hidden*2 × dim) */
         float *attn_norm, *ffn_norm;
+        /* packed GGUF dtype per matvec weight (0 = f32-dequant'd; else kept packed) */
+        int wq_dt, wk_dt, wv_dt, wo_dt, ffn_gate_dt, ffn_up_dt, ffn_down_dt, ffn_gate_up_dt;
     } host_layers[MAX_LAYERS];
 
     /* DOE's living overlay */
@@ -1640,10 +1787,19 @@ static int index_load(GGUFIndex *ps, const char *path) {
                        (unsigned long)ps->mmap_size);
             continue;
         }
-        float *data;
+        float *data; int data_dt = 0;
         const uint8_t *src = ps->mmap_base + byte_offset;
+        char *n = tinfo[i].name;
+        /* matvec weights stay PACKED (dequantized inline by doe_qmatvec, no f32
+         * blow-up); embeddings / norms / biases dequant to f32 as before. */
+        int is_mv_w = strstr(n,"attn_q.weight")||strstr(n,"attn_k.weight")||strstr(n,"attn_v.weight")||
+                      strstr(n,"attn_output.weight")||strstr(n,"ffn_gate.weight")||strstr(n,"ffn_up.weight")||
+                      strstr(n,"ffn_down.weight")||strstr(n,"ffn_gate_up")||strcmp(n,"output.weight")==0;
         if (dt == 0) {
             data = (float*)src; /* f32: point directly into mmap */
+        } else if (is_mv_w && pq_for(dt, (int)tinfo[i].dims[0])) {
+            data = (float*)src; /* keep packed — matvec dequants inline */
+            data_dt = dt;
         } else {
             /* dequantize to f32 */
             data = malloc(n_elems * sizeof(float));
@@ -1658,7 +1814,6 @@ static int index_load(GGUFIndex *ps, const char *path) {
             ps->f16_bufs = realloc(ps->f16_bufs, (ps->n_f16_bufs+1)*sizeof(float*));
             ps->f16_bufs[ps->n_f16_bufs++] = data;
         }
-        char *n = tinfo[i].name;
         /* debug: if (i < 15) printf("[tensor] %s dims=[%lu,%lu]\n", n, (unsigned long)tinfo[i].dims[0], (unsigned long)tinfo[i].dims[1]); */
         if (strcmp(n, "token_embd.weight") == 0) {
             ps->host_tok_emb = data;
@@ -1666,29 +1821,29 @@ static int index_load(GGUFIndex *ps, const char *path) {
             wired++;
         }
         else if (strcmp(n, "output_norm.weight") == 0) { ps->host_norm = data; wired++; }
-        else if (strcmp(n, "output.weight") == 0) { ps->host_output = data; wired++; }
+        else if (strcmp(n, "output.weight") == 0) { ps->host_output = data; ps->host_output_dt = data_dt; wired++; }
         else {
             int l = -1; sscanf(n, "blk.%d.", &l);
             if (l >= 0 && l < MAX_LAYERS && l < ps->host_n_layers) {
-                if (strstr(n, "attn_q.weight")) { ps->host_layers[l].wq = data; wired++; }
-                else if (strstr(n, "attn_k.weight")) { ps->host_layers[l].wk = data; wired++; }
-                else if (strstr(n, "attn_v.weight")) { ps->host_layers[l].wv = data; wired++; }
-                else if (strstr(n, "attn_output.weight")) { ps->host_layers[l].wo = data; wired++; }
+                if (strstr(n, "attn_q.weight")) { ps->host_layers[l].wq = data; ps->host_layers[l].wq_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_k.weight")) { ps->host_layers[l].wk = data; ps->host_layers[l].wk_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_v.weight")) { ps->host_layers[l].wv = data; ps->host_layers[l].wv_dt = data_dt; wired++; }
+                else if (strstr(n, "attn_output.weight")) { ps->host_layers[l].wo = data; ps->host_layers[l].wo_dt = data_dt; wired++; }
                 else if (strstr(n, "attn_q.bias")) { ps->host_layers[l].bq = data; wired++; }
                 else if (strstr(n, "attn_k.bias")) { ps->host_layers[l].bk = data; wired++; }
                 else if (strstr(n, "attn_v.bias")) { ps->host_layers[l].bv = data; wired++; }
-                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp") && !strstr(n, "ffn_gate_up")) { ps->host_layers[l].ffn_gate = data; wired++; }
+                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp") && !strstr(n, "ffn_gate_up")) { ps->host_layers[l].ffn_gate = data; ps->host_layers[l].ffn_gate_dt = data_dt; wired++; }
                 else if (strstr(n, "ffn_up.weight") && !strstr(n, "gate_up")) {
                     /* Check if fused gate+up: dims[1] > host_hidden means [dim, hidden*2] */
                     if (ps->host_hidden > 0 && (int)tinfo[i].dims[1] > ps->host_hidden * 3 / 2) {
-                        ps->host_layers[l].ffn_gate_up = data;
+                        ps->host_layers[l].ffn_gate_up = data; ps->host_layers[l].ffn_gate_up_dt = data_dt;
                     } else {
-                        ps->host_layers[l].ffn_up = data;
+                        ps->host_layers[l].ffn_up = data; ps->host_layers[l].ffn_up_dt = data_dt;
                     }
                     wired++;
                 }
-                else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; wired++; }
-                else if (strstr(n, "ffn_gate_up_proj") || strstr(n, "ffn_gate_up.weight")) { ps->host_layers[l].ffn_gate_up = data; wired++; }
+                else if (strstr(n, "ffn_down.weight")) { ps->host_layers[l].ffn_down = data; ps->host_layers[l].ffn_down_dt = data_dt; wired++; }
+                else if (strstr(n, "ffn_gate_up_proj") || strstr(n, "ffn_gate_up.weight")) { ps->host_layers[l].ffn_gate_up = data; ps->host_layers[l].ffn_gate_up_dt = data_dt; wired++; }
                 else if (strstr(n, "attn_norm.weight")) { ps->host_layers[l].attn_norm = data; wired++; }
                 else if (strstr(n, "ffn_norm.weight")) { ps->host_layers[l].ffn_norm = data; wired++; }
                 else if (l == 0 && strstr(n, "ffn")) { printf("[doe] unwired FFN tensor: %s\n", n); }
@@ -2298,9 +2453,9 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
         else memcpy(xn, s->x, D*4);
 
-        matvec(s->q, ps->host_layers[l].wq, xn, ps->host_heads*hd, D);
-        matvec(s->k, ps->host_layers[l].wk, xn, kd, D);
-        matvec(s->v, ps->host_layers[l].wv, xn, kd, D);
+        doe_mv(s->q, ps->host_layers[l].wq, ps->host_layers[l].wq_dt, xn, ps->host_heads*hd, D);
+        doe_mv(s->k, ps->host_layers[l].wk, ps->host_layers[l].wk_dt, xn, kd, D);
+        doe_mv(s->v, ps->host_layers[l].wv, ps->host_layers[l].wv_dt, xn, kd, D);
 
         /* Add attention biases (Qwen2, optional) */
         if (ps->host_layers[l].bq) for (int i = 0; i < ps->host_heads*hd; i++) s->q[i] += ps->host_layers[l].bq[i];
@@ -2331,7 +2486,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 for (int d = 0; d < hd; d++) oh[d] += a * s->value_cache[vo+d];
             }
         }
-        matvec(s->xb, ps->host_layers[l].wo, ao, D, D);
+        doe_mv(s->xb, ps->host_layers[l].wo, ps->host_layers[l].wo_dt, ao, D, D);
         for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
 
         /* ── Parliament election + LoRA injection (after attention, before FFN) ── */
@@ -2366,16 +2521,16 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 
             if (ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down) {
                 /* Fused gate_up: [hidden*2, dim] → split into gate [0..H) and up [H..2H) */
-                matvec(s->hb2, ps->host_layers[l].ffn_gate_up, fn, H * 2, D);
+                doe_mv(s->hb2, ps->host_layers[l].ffn_gate_up, ps->host_layers[l].ffn_gate_up_dt, fn, H * 2, D);
                 for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb2[i]) * s->hb2[H + i];
-                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             } else if (ps->host_layers[l].ffn_gate && ps->host_layers[l].ffn_up && ps->host_layers[l].ffn_down) {
                 /* Standard separate gate + up */
-                matvec(s->hb, ps->host_layers[l].ffn_gate, fn, H, D);
-                matvec(s->hb2, ps->host_layers[l].ffn_up, fn, H, D);
+                doe_mv(s->hb, ps->host_layers[l].ffn_gate, ps->host_layers[l].ffn_gate_dt, fn, H, D);
+                doe_mv(s->hb2, ps->host_layers[l].ffn_up, ps->host_layers[l].ffn_up_dt, fn, H, D);
                 for (int i = 0; i < H; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
-                matvec(s->xb, ps->host_layers[l].ffn_down, s->hb, D, H);
+                doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             }
         }
@@ -2383,7 +2538,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 
     /* Final norm + LM head */
     rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
-    matvec(s->logits, ps->host_output, s->x, ps->host_vocab, D);
+    doe_mv(s->logits, ps->host_output, ps->host_output_dt, s->x, ps->host_vocab, D);
 
     return s->logits;
 }
