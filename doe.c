@@ -1230,9 +1230,16 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
 }
 
 /* matvec dispatch: packed weight (dt != 0) -> doe_qmatvec (inline dequant);
- * else the existing f32 matvec. The one call the forward uses for host weights. */
+ * else the existing f32 matvec. The one call the forward uses for host weights.
+ * DOE_INT8=1 opts the Q4_0 weights into the int8 dynamic-activation-quant fast path
+ * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
+static int g_doe_int8 = -1;
 static void doe_mv(float *out, const float *W, int dt, const float *x, int r, int c) {
-    if (dt && doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+    if (dt) {
+        if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
+        if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+        if (doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
+    }
     matvec(out, W, x, r, c);
 }
 
@@ -1318,6 +1325,18 @@ typedef struct {
     float complexity;         /* model complexity metric */
     uint64_t fingerprint;     /* hash of weight statistics — identifies this host */
 } WeightProfile;
+
+/* Dequantize a packed tensor to f32 (dispatch by GGUF dtype). Used by the sonar
+ * to profile weights that index_load now keeps packed (else it reads packed bytes
+ * as f32 — harmless overread on f16, a hard segfault on the smaller quants). */
+static void doe_dequant_to_f32(const uint8_t *src, int dt, uint64_t n, float *out) {
+    if (dt == 1) { const uint16_t *h = (const uint16_t*)src; for (uint64_t j = 0; j < n; j++) out[j] = f16_to_f32(h[j]); }
+    else if (dt == 2)  dequant_q4_0(src, out, n);
+    else if (dt == 6)  dequant_q5_0(src, out, n);
+    else if (dt == 8)  dequant_q8_0(src, out, n);
+    else if (dt == 12) dequant_q4_k(src, out, n);
+    else if (dt == 14) dequant_q6_k(src, out, n);
+}
 
 static void profile_weights(float *data, int rows, int cols, LayerProfile *out) {
     int n = rows * cols;
@@ -1878,10 +1897,23 @@ static int index_load(GGUFIndex *ps, const char *path) {
     printf("[sonar] profiling host weights...\n");
     ps->profile.n_layers = ps->host_n_layers;
     for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
-        if (ps->host_layers[l].ffn_gate)
-            profile_weights(ps->host_layers[l].ffn_gate, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
-        else
+        if (ps->host_layers[l].ffn_gate) {
+            int gdt = ps->host_layers[l].ffn_gate_dt;
+            if (gdt) {
+                /* weight kept packed — dequant a temp f32 copy just for profiling */
+                uint64_t ne = (uint64_t)ps->host_hidden * ps->host_dim;
+                float *tmp = malloc(ne * sizeof(float));
+                if (tmp) {
+                    doe_dequant_to_f32((const uint8_t*)ps->host_layers[l].ffn_gate, gdt, ne, tmp);
+                    profile_weights(tmp, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
+                    free(tmp);
+                } else memset(&ps->profile.layers[l], 0, sizeof(LayerProfile));
+            } else {
+                profile_weights(ps->host_layers[l].ffn_gate, ps->host_hidden, ps->host_dim, &ps->profile.layers[l]);
+            }
+        } else {
             memset(&ps->profile.layers[l], 0, sizeof(LayerProfile));
+        }
     }
     float total_h = 0;
     for (int l = 0; l < ps->profile.n_layers; l++) total_h += ps->profile.layers[l].health;
