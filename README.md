@@ -280,17 +280,17 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 
 ## supported formats
 
-DOE dequantizes at load time — any supported GGUF runs through the same f32 forward pass.
+DOE keeps quantized GGUF blocks packed in RAM and dequantizes them inline during the matvec — no f32 blow-up. F32 is mmap'd directly; F16 and the quants run through the same notorch packed-matvec interface (`nt_qmatvec`, vendored inline), and Q4_0 can also take the int8 fast path (`DOE_INT8=1`).
 
 | format | GGML type | status |
 |--------|-----------|--------|
-| F32    | 0         | native (mmap'd)|
-| F16    | 1         | dequant to f32 |
-| Q4_0   | 2         | dequant to f32 |
-| Q5_0   | 6         | dequant to f32 |
-| Q8_0   | 8         | dequant to f32 |
-| Q4_K   | 12        | dequant to f32 |
-| Q6_K   | 14        | dequant to f32 |
+| F32    | 0         | native (mmap'd) |
+| F16    | 1         | packed · inline dequant |
+| Q4_0   | 2         | packed · inline dequant · int8 opt-in |
+| Q5_0   | 6         | packed · inline dequant |
+| Q8_0   | 8         | packed · inline dequant |
+| Q4_K   | 12        | packed · inline dequant |
+| Q6_K   | 14        | packed · inline dequant |
 
 ## supported architectures
 
@@ -346,6 +346,6 @@ See [docs/doe_architecture.md](docs/doe_architecture.md) for the full technical 
 
 ---
 
-C. one file. zero dependencies beyond libc.
+C. one file. no runtime dependencies beyond libc / libm / pthreads; optional BLAS or CUDA builds if you want them.
 
 *the weights are mortal. the parliament is eternal.*
