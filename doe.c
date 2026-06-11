@@ -3156,6 +3156,7 @@ static void chat(GGUFIndex *ps) {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static int g_serve_port = 0; /* 0 = disabled */
+static int g_serve_public = 0; /* D-M4: 0 = bind 127.0.0.1 (default), 1 = 0.0.0.0 (--serve-public) */
 
 /* JSON-escape a string into buf. Returns bytes written (not counting NUL). */
 static int json_escape(const char *src, char *buf, int bufsz) {
@@ -3402,7 +3403,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = g_serve_public ? INADDR_ANY : htonl(INADDR_LOOPBACK); /* D-M4: localhost by default */
     addr.sin_port = htons(g_serve_port);
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -3417,7 +3418,7 @@ static void serve_loop(GGUFIndex *ps, const char *exe_dir) {
     snprintf(ui_path, sizeof(ui_path), "%sdoe_ui.html", exe_dir);
     snprintf(vis_path, sizeof(vis_path), "%sdoe.html", exe_dir);
 
-    printf("[serve] parliament listening on http://0.0.0.0:%d\n", g_serve_port);
+    printf("[serve] parliament listening on http://%s:%d\n", g_serve_public ? "0.0.0.0" : "127.0.0.1", g_serve_port);
     printf("[serve]   /         → chat UI\n");
     printf("[serve]   /visual   → parliament terminal\n");
     printf("[serve]   /health   → status\n");
@@ -3531,6 +3532,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--serve") == 0 && i+1 < argc) { g_serve_port = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--serve-public") == 0) { g_serve_public = 1; }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("doe.c — DOE: inference architecture over any GGUF\n\n");
             printf("  --model PATH    GGUF to index (or auto-detect)\n");
