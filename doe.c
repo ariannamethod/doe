@@ -1670,11 +1670,19 @@ static int index_load(GGUFIndex *ps, const char *path) {
 
     for (uint64_t i = 0; i < n_kv; i++) {
         PC(8); uint64_t klen = *(uint64_t*)p; p += 8;
-        if (klen > 255) { p += klen + 4; continue; } /* skip long keys */
-        char key[256]; memcpy(key, p, klen); key[klen] = '\0'; p += klen;
+        char key[256];
+        if (klen > 255) {
+            /* D-M1: an oversized key still has a vtype + value after it — skip
+             * only the key bytes and let the vtype handling below parse/skip the
+             * value, or the parser desyncs. Empty key matches no strstr. */
+            PC(klen); p += klen; key[0] = '\0';
+        } else {
+            PC(klen); memcpy(key, p, klen); key[klen] = '\0'; p += klen; /* D-M2: bound key payload */
+        }
         PC(4); uint32_t vtype = *(uint32_t*)p; p += 4;
         if (vtype == 8) { /* string */
             PC(8); uint64_t vlen = *(uint64_t*)p; p += 8;
+            PC(vlen); /* D-M2: bound the string payload before any memcpy reads it */
             if (strstr(key, "general.architecture") && vlen < 64) {
                 memcpy(ps->host_arch, p, vlen); ps->host_arch[vlen] = 0;
             }
@@ -1731,6 +1739,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 elem_sz = 4;
                 /* float32 array: tokenizer.ggml.scores */
                 if (atype == 6 && strstr(key, "tokenizer.ggml.scores") && alen < 200000) {
+                    PC(alen * 4); /* D-M2: bound the scores payload (else up to ~800KB OOB read) */
                     ps->vocab_scores = malloc(alen * sizeof(float));
                     memcpy(ps->vocab_scores, p, alen * 4);
                 }
@@ -1765,6 +1774,7 @@ static int index_load(GGUFIndex *ps, const char *path) {
                 }
                 continue;
             }
+            PC(alen * elem_sz); /* D-M2: bound the array payload before skipping past it */
             p += alen * elem_sz;
         } else { p += 4; } /* unknown — guess 4 bytes */
     }
