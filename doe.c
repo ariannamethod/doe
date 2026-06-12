@@ -129,6 +129,8 @@ static float rand_normal(void) { float u1=rand_uniform(),u2=rand_uniform(); if(u
 static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
 static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
+/* M4 slot ids for the FFN/attention half-layer chains on GPU (NT_SLOT_MAX=64). */
+enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB };
 /* A14: expert poison check — catches BOTH faces of notorch drift: NaN/Inf and finite |value|-explosion
  * (the latter passes isfinite but still poisons the forward when injected at alpha>0). */
 static int lora_poisoned(const float *A, const float *B) {
@@ -2529,8 +2531,26 @@ static InferState alloc_infer(GGUFIndex *ps, int max_seq) {
     s.logits = calloc(ps->host_vocab, 4);
     s.hb = calloc(H, 4); s.hb2 = calloc(H * 2, 4); /* *2 for fused gate_up */
     s.expert_out = calloc(D, 4);
-    s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
-    s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+    /* M4 stage (a): KV-cache on a page-aligned region so the GPU attn_decode
+     * kernel can later resolve it by offset (nt_metal_register_region). Apple
+     * Silicon page = 16384 (getpagesize()), not 4096. CPU attention still reads
+     * it exactly as before — this stage only changes alloc + registration. */
+    size_t kv_bytes = (size_t)ps->host_n_layers * max_seq * kd * 4;
+    if (posix_memalign((void**)&s.key_cache,   (size_t)getpagesize(), kv_bytes) ||
+        posix_memalign((void**)&s.value_cache, (size_t)getpagesize(), kv_bytes)) {
+        fprintf(stderr, "[doe] KV posix_memalign failed — falling back to calloc\n");
+        s.key_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+        s.value_cache = calloc(ps->host_n_layers * max_seq * kd, 4);
+    } else {
+        memset(s.key_cache, 0, kv_bytes);
+        memset(s.value_cache, 0, kv_bytes);
+#ifdef USE_METAL
+        if (nt_metal_available()) {
+            nt_metal_register_region(s.key_cache, kv_bytes);
+            nt_metal_register_region(s.value_cache, kv_bytes);
+        }
+#endif
+    }
     int half = ps->host_head_dim / 2;
     s.cos_cache = calloc(max_seq * half, 4);
     s.sin_cache = calloc(max_seq * half, 4);
@@ -2572,6 +2592,52 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         if (!ps->host_layers[l].wq) continue;
 
         /* ── Host attention ── */
+        int attn_done = 0;
+#ifdef USE_METAL
+        /* M4 stage (в): attention half-layer on GPU slots — rmsnorm -> qkv matvecs
+         * -> rope -> copy_to_region(KV) -> attn_decode(GQA) -> o-proj -> residual,
+         * one sync. rope_f32 == doe apply_rope (NeoX pairs, theta^-2i/hd). Guarded
+         * to no-bias archs (Mistral) with Q4_K/Q6_K qkv/wo. CPU fallback otherwise. */
+        {
+            int qd=ps->host_layers[l].wq_dt, kdt=ps->host_layers[l].wk_dt,
+                vd=ps->host_layers[l].wv_dt, od=ps->host_layers[l].wo_dt;
+            if (!getenv("DOE_NO_SLOTS") && nt_metal_available() && ps->host_layers[l].attn_norm &&
+                !ps->host_layers[l].bq && !ps->host_layers[l].bk && !ps->host_layers[l].bv &&
+                (qd==12||qd==14)&&(kdt==12||kdt==14)&&(vd==12||vd==14)&&(od==12||od==14)) {
+                int co2 = l * s->max_seq * kd + pos * kd;
+                float *Kbase = s->key_cache   + (size_t)l * s->max_seq * kd;
+                float *Vbase = s->value_cache + (size_t)l * s->max_seq * kd;
+                int qn = ps->host_heads * hd;
+                nt_metal_slot_alloc(SLOT_X, D*4);   nt_metal_slot_alloc(SLOT_FN, D*4);
+                nt_metal_slot_alloc(SLOT_Q, qn*4);  nt_metal_slot_alloc(SLOT_K, kd*4);
+                nt_metal_slot_alloc(SLOT_V, kd*4);  nt_metal_slot_alloc(SLOT_O, qn*4);
+                nt_metal_slot_alloc(SLOT_XB, D*4);
+                nt_metal_slot_upload(SLOT_X, s->x, D*4);
+                nt_metal_batch_begin();
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
+                if (qd==14)  nt_metal_q6k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_Q,(const uint8_t*)ps->host_layers[l].wq,SLOT_FN,qn,D);
+                if (kdt==14) nt_metal_q6k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
+                if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta);
+                nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
+                nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
+                nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
+                                     ps->host_heads, ps->host_kv_heads, hd,
+                                     (uint32_t)kd, (uint32_t)hd, (uint32_t)kd, (uint32_t)hd, sc);
+                if (od==14)  nt_metal_q6k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                else         nt_metal_q4k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
+                nt_metal_add(SLOT_X, SLOT_X, SLOT_XB, D);
+                nt_metal_batch_commit();
+                nt_metal_slot_download(SLOT_X, s->x, D*4);
+                attn_done = 1;
+            }
+        }
+#endif
+        if (!attn_done) {
         float *xn = s->xb;
         if (ps->host_layers[l].attn_norm) rmsnorm(xn, s->x, ps->host_layers[l].attn_norm, D, ps->rms_norm_eps);
         else memcpy(xn, s->x, D*4);
@@ -2620,6 +2686,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         }
         doe_mv(s->xb, ps->host_layers[l].wo, ps->host_layers[l].wo_dt, ao, D, ps->host_heads*hd); /* Y-1b: WO cols = heads*head_dim (4096), not dim (5120) */
         for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
+        } /* !attn_done */
 
         /* ── Parliament election + LoRA injection (after attention, before FFN) ── */
         /* A13: skip injection entirely when alpha=0 — avoids 0*NaN poisoning from drifted experts */
@@ -2648,6 +2715,42 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
 
         /* ── Host FFN (SwiGLU) ── */
         {
+            int ffn_done = 0;
+#ifdef USE_METAL
+            /* M4 stage (b): FFN half-layer on GPU slots — rmsnorm -> gate/up matvecs ->
+             * silu_mul -> down -> residual, one sync. Fused gate_up is split into two
+             * sub-W matvecs (silu_mul needs two slots). x is host-bridged this stage
+             * (attention still CPU); stage (г) keeps x resident. Falls through to the
+             * CPU path when Metal is off or a dt is unsupported by the slot matvec. */
+            {
+                int gdt = ps->host_layers[l].ffn_gate_up_dt, ddt = ps->host_layers[l].ffn_down_dt;
+                if (!getenv("DOE_NO_SLOTS") && nt_metal_available() && ps->host_layers[l].ffn_norm &&
+                    ps->host_layers[l].ffn_gate_up && ps->host_layers[l].ffn_down &&
+                    (gdt==12||gdt==14) && (ddt==12||ddt==14)) {
+                    const uint8_t *Wgu = (const uint8_t*)ps->host_layers[l].ffn_gate_up;
+                    const uint8_t *Wdn = (const uint8_t*)ps->host_layers[l].ffn_down;
+                    size_t gu_row = quant_raw_bytes(gdt, D);
+                    nt_metal_slot_alloc(SLOT_X, D*4);  nt_metal_slot_alloc(SLOT_FN, D*4);
+                    nt_metal_slot_alloc(SLOT_G, H*4);  nt_metal_slot_alloc(SLOT_U, H*4);
+                    nt_metal_slot_alloc(SLOT_HB, H*4); nt_metal_slot_alloc(SLOT_DN, D*4);
+                    nt_metal_slot_upload(SLOT_X, s->x, D*4);
+                    nt_metal_batch_begin();
+                    nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
+                    if (gdt==14) { nt_metal_q6k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q6k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    else         { nt_metal_q4k_matvec_slot(SLOT_G, Wgu, SLOT_FN, H, D);
+                                   nt_metal_q4k_matvec_slot(SLOT_U, Wgu+(size_t)H*gu_row, SLOT_FN, H, D); }
+                    nt_metal_silu_mul(SLOT_HB, SLOT_G, SLOT_U, H);
+                    if (ddt==14) nt_metal_q6k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                    else         nt_metal_q4k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
+                    nt_metal_add(SLOT_X, SLOT_X, SLOT_DN, D);
+                    nt_metal_batch_commit();
+                    nt_metal_slot_download(SLOT_X, s->x, D*4);
+                    ffn_done = 1;
+                }
+            }
+#endif
+            if (!ffn_done) {
             float *fn = s->xb;
             if (ps->host_layers[l].ffn_norm) rmsnorm(fn, s->x, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
             else memcpy(fn, s->x, D*4);
@@ -2672,6 +2775,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 doe_mv(s->xb, ps->host_layers[l].ffn_down, ps->host_layers[l].ffn_down_dt, s->hb, D, H);
                 for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
             }
+            } /* !ffn_done */
         }
     }
 
