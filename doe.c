@@ -130,7 +130,9 @@ static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
 static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
 /* M4 slot ids for the FFN/attention half-layer chains on GPU (NT_SLOT_MAX=64). */
-enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB, SLOT_LOGITS };
+enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB, SLOT_LOGITS,
+       /* DOE parliament-on-GPU (alpha != 0): election + LoRA inject inside the resident CB */
+       SLOT_PTMP, SLOT_PGATE, SLOT_PVOTES, SLOT_PRES, SLOT_PALIVE, SLOT_PCONS };
 /* A14: expert poison check — catches BOTH faces of notorch drift: NaN/Inf and finite |value|-explosion
  * (the latter passes isfinite but still poisons the forward when injected at alpha>0). */
 static int lora_poisoned(const float *A, const float *B) {
@@ -1539,6 +1541,16 @@ typedef struct {
     FieldLayer field_layers[MAX_LAYERS];
     int n_field_layers;
 
+    /* Parliament-on-GPU: contiguous page-aligned arena of the (frozen at
+     * inference) expert weights + vote rows, registered for slot kernels.
+     * Per layer: [w_vote 16*D | per-expert (B rank*D, A D*rank) x16].
+     * Built once after field init when Metal is available and alpha != 0. */
+    float  *expert_arena;
+    size_t  expert_arena_floats;
+    size_t  expert_layer_floats;   /* stride per layer, in floats */
+    int     expert_arena_ready;
+    int     cons_slot_init;        /* SLOT_PCONS seeded from parliament.consensus once */
+
     /* Host profiling */
     WeightProfile profile;
 
@@ -1704,6 +1716,57 @@ static void free_lora_expert(LoraExpert *e) {
     e->lora_A = e->lora_B = NULL;
     e->alive = 0; e->vitality = 0;
 }
+
+#ifdef USE_METAL
+/* Parliament-on-GPU step 1 — pack the (inference-frozen) per-layer vote rows +
+ * expert LoRA matrices into one contiguous, page-aligned arena and register it
+ * as a zero-copy GPU region. The election/inject kernels then bind w_vote / A /
+ * B by offset (resolve_region) instead of uploading per token. Built once at
+ * load, only when Metal is live and the parliament is active (alpha != 0). The
+ * experts are static at --train 0 (births/deaths gated on g_train, :3511), so
+ * one pack suffices — no re-sync. Dead expert slots stay zero (memset arena) so
+ * a gate weight of 0 over them is a true no-op.
+ *   Per layer: [ w_vote MAX_EXPERTS*D | per-expert (B rank*D, A D*rank) x MAX_EXPERTS ]. */
+static void field_repack_arena(GGUFIndex *ps) {
+    if (ps->expert_arena_ready) return;
+    int D = ps->host_dim, rank = ps->lora_rank, L = ps->n_field_layers;
+    size_t per_expert  = (size_t)rank * D + (size_t)D * rank;            /* B then A */
+    size_t layer_floats = (size_t)MAX_EXPERTS * D + (size_t)MAX_EXPERTS * per_expert;
+    size_t total_floats = layer_floats * (size_t)L;
+    size_t pg    = (size_t)getpagesize();
+    size_t bytes = (total_floats * sizeof(float) + pg - 1) / pg * pg;    /* register needs page-aligned len */
+    float *arena = NULL;
+    if (posix_memalign((void**)&arena, pg, bytes) != 0 || !arena) {
+        fprintf(stderr, "[doe] parliament arena posix_memalign(%zu) failed — parliament stays on CPU\n", bytes);
+        return;
+    }
+    memset(arena, 0, bytes);                                            /* dead experts -> zero contribution */
+    for (int l = 0; l < L; l++) {
+        FieldLayer *fl = &ps->field_layers[l];
+        float *base = arena + (size_t)l * layer_floats;
+        memcpy(base, fl->parliament.w_vote, (size_t)MAX_EXPERTS * D * sizeof(float));
+        float *ep = base + (size_t)MAX_EXPERTS * D;
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            if (!fl->experts[e].alive) continue;                        /* leave zero */
+            float *eb = ep + (size_t)e * per_expert;
+            memcpy(eb,                    fl->experts[e].lora_B, (size_t)rank * D * sizeof(float)); /* B [rank,D] */
+            memcpy(eb + (size_t)rank * D, fl->experts[e].lora_A, (size_t)D * rank * sizeof(float)); /* A [D,rank] */
+        }
+    }
+    if (nt_metal_register_region(arena, bytes) != 0) {
+        fprintf(stderr, "[doe] parliament arena register_region failed — parliament stays on CPU\n");
+        free(arena);
+        return;
+    }
+    ps->expert_arena        = arena;
+    ps->expert_arena_floats = total_floats;
+    ps->expert_layer_floats = layer_floats;
+    ps->expert_arena_ready  = 1;
+    fprintf(stderr, "[doe] parliament arena: %.1f MB registered (%d layers x %zu f/layer; arena[0]=%.6f src=%.6f)\n",
+            (double)bytes / (1024.0*1024.0), L, layer_floats,
+            arena[0], ps->field_layers[0].parliament.w_vote[0]);
+}
+#endif
 
 static int tok_lookup(GGUFIndex *ps, const char *s, int len);
 static void tok_ht_build(GGUFIndex *ps);
@@ -2069,6 +2132,10 @@ static int index_load(GGUFIndex *ps, const char *path) {
         }
     }
 
+    /* NB: the parliament-on-GPU arena is packed AFTER mycelium_load (in main),
+     * not here — a spore mutates w_vote/A/B, so packing must see the final
+     * expert state. See field_repack_arena call after mycelium_load. */
+
     ps->active = 1;
     /* Build token hash table for O(1) lookup, then GPT-2 BPE scores */
     tok_ht_build(ps);
@@ -2116,6 +2183,14 @@ static void index_free(GGUFIndex *ps) {
         free(ps->bpe_merges);
     }
     if (ps->mmap_base) munmap(ps->mmap_base, ps->mmap_size);
+#ifdef USE_METAL
+    /* expert_arena is wrapped by a NoCopy MTLBuffer (deallocator:nil) in notorch's
+     * segment table and there is no per-region unregister. index_free runs once at
+     * process exit (single-model lifecycle, :4171/:4221), so we deliberately do not
+     * free the arena here — the OS reclaims it at exit, and the registered buffer is
+     * guaranteed to outlive any GPU use. Freeing under the live NoCopy view would
+     * leave a dangling segment. */
+#endif
     memset(ps, 0, sizeof(GGUFIndex));
 }
 
@@ -2625,8 +2700,11 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
      * per-layer slot path. DOE_NO_RESIDENT falls back. */
     int resident_done = 0, head_done = 0;
 #ifdef USE_METAL
+    /* alpha==0: pure fast path. alpha!=0 with a registered expert arena: the
+     * parliament (election + LoRA inject) runs on the GPU between attn and ffn,
+     * so x stays resident and the token is still one command buffer. */
     if (!getenv("DOE_NO_SLOTS") && !getenv("DOE_NO_RESIDENT") && nt_metal_available() &&
-        ps->lora_alpha == 0.0f) {
+        (ps->lora_alpha == 0.0f || ps->expert_arena_ready)) {
         int eligible = 1;
         for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
             if (!ps->host_layers[l].wq) continue;
@@ -2653,6 +2731,35 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
             nt_metal_slot_alloc(SLOT_U, H*4);  nt_metal_slot_alloc(SLOT_HB, H*4);
             nt_metal_slot_alloc(SLOT_DN, D*4);
             nt_metal_slot_upload(SLOT_X, s->x, D*4);
+            /* parliament-on-GPU setup (alpha != 0): per-token resonance + frozen
+             * alive mask + persistent consensus, all resident so the election runs
+             * in-batch. freq[e]=2*pi*e/initial_experts and alive[e] are layer-
+             * independent at inference, so layer 0 is representative. */
+            int parl = (ps->lora_alpha != 0.0f) && ps->expert_arena_ready;
+            if (parl) {
+                int ne = MAX_EXPERTS;
+                nt_metal_slot_alloc(SLOT_PTMP,  (uint64_t)ne*ps->lora_rank*4);
+                nt_metal_slot_alloc(SLOT_PGATE, (uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PVOTES,(uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PRES,  (uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PALIVE,(uint64_t)ne*4);
+                nt_metal_slot_alloc(SLOT_PCONS, (uint64_t)MAX_LAYERS*4);
+                float res[MAX_EXPERTS], alv[MAX_EXPERTS];
+                FieldLayer *fl0 = &ps->field_layers[0];
+                for (int e = 0; e < ne; e++) {
+                    res[e] = 0.1f * expert_resonance(fl0->experts[e].frequency, &s->hs);
+                    alv[e] = fl0->experts[e].alive ? 1.0f : 0.0f;
+                }
+                nt_metal_slot_upload(SLOT_PRES,   res, (uint64_t)ne*4);
+                nt_metal_slot_upload(SLOT_PALIVE, alv, (uint64_t)ne*4);
+                if (!ps->cons_slot_init) {
+                    float cons[MAX_LAYERS];
+                    for (int l = 0; l < MAX_LAYERS; l++)
+                        cons[l] = (l < ps->n_field_layers) ? ps->field_layers[l].parliament.consensus : 0.5f;
+                    nt_metal_slot_upload(SLOT_PCONS, cons, (uint64_t)MAX_LAYERS*4);
+                    ps->cons_slot_init = 1;
+                }
+            }
             nt_metal_batch_begin();
             for (int l = 0; l < ps->host_n_layers && l < MAX_LAYERS; l++) {
                 if (!ps->host_layers[l].wq) continue;
@@ -2681,6 +2788,16 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 if (od==14)  nt_metal_q6k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
                 else         nt_metal_q4k_matvec_slot(SLOT_XB,(const uint8_t*)ps->host_layers[l].wo,SLOT_O,D,qn);
                 nt_metal_add(SLOT_X, SLOT_X, SLOT_XB, D);
+                /* parliament: election (w_vote@x -> variable-k gate) + LoRA inject,
+                 * x += alpha * sum_k w_k * A_k @ (B_k @ x), all on the resident x. */
+                if (parl) {
+                    const float *lb = ps->expert_arena + (size_t)l * ps->expert_layer_floats;
+                    nt_metal_parliament_votes(lb, SLOT_X, SLOT_PVOTES, D, MAX_EXPERTS);
+                    nt_metal_parliament_elect(SLOT_PVOTES, SLOT_PRES, SLOT_PALIVE, SLOT_PCONS,
+                                              SLOT_PGATE, MAX_EXPERTS, l, MIN_EXPERTS);
+                    nt_metal_parliament_inject(SLOT_X, SLOT_PTMP, SLOT_PGATE, lb,
+                                               D, ps->lora_rank, MAX_EXPERTS, ps->lora_alpha);
+                }
                 /* ffn half-layer (fused gate_up or separate gate + up) */
                 nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_layers[l].ffn_norm, D, ps->rms_norm_eps);
                 if (ps->host_layers[l].ffn_gate_up) {
@@ -2726,8 +2843,8 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
             struct timespec _r1; clock_gettime(CLOCK_MONOTONIC, &_r1);
             g_resident_ns += (_r1.tv_sec-_r0.tv_sec)*1e9 + (_r1.tv_nsec-_r0.tv_nsec);
             if (getenv("DOE_DEBUG_TIMING") && pos == 0)
-                fprintf(stderr, "[resident] engaged: whole token in 1 command buffer (%d layers)\n",
-                        ps->host_n_layers);
+                fprintf(stderr, "[resident] engaged: whole token in 1 command buffer (%d layers, parliament=%s)\n",
+                        ps->host_n_layers, parl ? "on" : "off");
         }
     }
 #endif
@@ -4129,6 +4246,14 @@ int main(int argc, char **argv) {
     mycelium_init(&mycelium);
     if (mycelium_load(&idx, idx.profile.fingerprint))
         printf("[mycelium] resumed adaptation for this index.\n");
+
+#ifdef USE_METAL
+    /* Parliament-on-GPU: pack the (now final, post-spore) frozen experts into a
+     * registered arena so the election/inject kernels run inside the resident
+     * command buffer at alpha!=0 without dropping x off the GPU. Metal-live +
+     * parliament-active only; experts are static at --train 0. */
+    if (nt_metal_available() && idx.lora_alpha != 0.0f) field_repack_arena(&idx);
+#endif
 
     /* ── Chat or Serve ── */
     if (g_serve_port > 0) {
