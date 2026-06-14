@@ -130,7 +130,7 @@ static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
 static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
 /* M4 slot ids for the FFN/attention half-layer chains on GPU (NT_SLOT_MAX=64). */
-enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB };
+enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB, SLOT_LOGITS };
 /* A14: expert poison check — catches BOTH faces of notorch drift: NaN/Inf and finite |value|-explosion
  * (the latter passes isfinite but still poisons the forward when injected at alpha>0). */
 static int lora_poisoned(const float *A, const float *B) {
@@ -2623,7 +2623,7 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
      * between attn and ffn) and every layer slot-eligible. The serial-dispatch
      * encoder serialises the reused slots, so it is bit-identical to the
      * per-layer slot path. DOE_NO_RESIDENT falls back. */
-    int resident_done = 0;
+    int resident_done = 0, head_done = 0;
 #ifdef USE_METAL
     if (!getenv("DOE_NO_SLOTS") && !getenv("DOE_NO_RESIDENT") && nt_metal_available() &&
         ps->lora_alpha == 0.0f) {
@@ -2705,8 +2705,23 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 else         nt_metal_q4k_matvec_slot(SLOT_DN, Wdn, SLOT_HB, D, H);
                 nt_metal_add(SLOT_X, SLOT_X, SLOT_DN, D);
             }
+            /* fold final norm + lm_head into the same command buffer when the
+             * output weight is slot-matvec-able: norm -> lm_head on the GPU,
+             * download logits (vocab) instead of x (dim). One fewer solo
+             * matvec + round-trip. CPU lm_head path runs only when not folded. */
+            int hf = ps->host_norm && ps->host_output && !getenv("DOE_NO_HEADFOLD") &&
+                     (ps->host_output_dt==12 || ps->host_output_dt==14);
+            if (hf) {
+                nt_metal_slot_alloc(SLOT_LOGITS, (uint64_t)ps->host_vocab*4);
+                nt_metal_rmsnorm(SLOT_FN, SLOT_X, ps->host_norm, D, ps->rms_norm_eps);
+                if (ps->host_output_dt==14)
+                    nt_metal_q6k_matvec_slot(SLOT_LOGITS, (const uint8_t*)ps->host_output, SLOT_FN, ps->host_vocab, D);
+                else
+                    nt_metal_q4k_matvec_slot(SLOT_LOGITS, (const uint8_t*)ps->host_output, SLOT_FN, ps->host_vocab, D);
+            }
             nt_metal_batch_commit();
-            nt_metal_slot_download(SLOT_X, s->x, D*4);
+            if (hf) { nt_metal_slot_download(SLOT_LOGITS, s->logits, (uint64_t)ps->host_vocab*4); head_done = 1; }
+            else      nt_metal_slot_download(SLOT_X, s->x, D*4);
             resident_done = 1;
             struct timespec _r1; clock_gettime(CLOCK_MONOTONIC, &_r1);
             g_resident_ns += (_r1.tv_sec-_r0.tv_sec)*1e9 + (_r1.tv_nsec-_r0.tv_nsec);
@@ -2908,12 +2923,14 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         }
     }
 
-    /* Final norm + LM head */
-    struct timespec _h0; clock_gettime(CLOCK_MONOTONIC, &_h0);
-    rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
-    doe_mv(s->logits, ps->host_output, ps->host_output_dt, s->x, ps->host_vocab, D);
-    struct timespec _h1; clock_gettime(CLOCK_MONOTONIC, &_h1);
-    g_head_ns += (_h1.tv_sec-_h0.tv_sec)*1e9 + (_h1.tv_nsec-_h0.tv_nsec);
+    /* Final norm + LM head (skipped when folded into the resident CB above) */
+    if (!head_done) {
+        struct timespec _h0; clock_gettime(CLOCK_MONOTONIC, &_h0);
+        rmsnorm(s->x, s->x, ps->host_norm, D, ps->rms_norm_eps);
+        doe_mv(s->logits, ps->host_output, ps->host_output_dt, s->x, ps->host_vocab, D);
+        struct timespec _h1; clock_gettime(CLOCK_MONOTONIC, &_h1);
+        g_head_ns += (_h1.tv_sec-_h0.tv_sec)*1e9 + (_h1.tv_nsec-_h0.tv_nsec);
+    }
 
     return s->logits;
 }
