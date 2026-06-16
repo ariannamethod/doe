@@ -129,6 +129,13 @@ static float rand_normal(void) { float u1=rand_uniform(),u2=rand_uniform(); if(u
 static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 static float g_field_gain = 1.0f; /* A11a: scale Dario field overlay on logits; 1.0 = full, 0 = bare host */
 static int g_train = 0; /* A13b/A14: notorch online-learning during inference; DEFAULT 0=off (Oleg+Mythos 2026-06-12: organism must not re-sew its own weights mid-sentence; online learning returns later as async between turns, ogemma vision); 1=on */
+static int g_gen_max_new = 200; /* bounded one-shot validation; default preserves old chat length */
+static int g_gen_top_k = 40;
+static float g_gen_temp_override = -1.0f; /* <0 uses field effective temperature */
+static int g_once = 0; /* exit after one generated answer; useful for artifact isolation */
+static int g_load_spore = 1;
+static int g_save_spore = 1;
+static int g_rope_norm = 0; /* probe: llama.cpp NORM RoPE pairs consecutive head values */
 /* M4 slot ids for the FFN/attention half-layer chains on GPU (NT_SLOT_MAX=64). */
 enum { SLOT_X = 0, SLOT_FN, SLOT_G, SLOT_U, SLOT_HB, SLOT_DN, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_XB, SLOT_LOGITS,
        /* DOE parliament-on-GPU (alpha != 0): election + LoRA inject inside the resident CB */
@@ -1324,12 +1331,21 @@ static void softmax_n(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= s;
 }
 
-static void apply_rope(float *v, int pos, float *cc, float *sc, int hd) {
+static void apply_rope_mode(float *v, int pos, float *cc, float *sc, int hd, int norm_pairs) {
     int h = hd/2, off = pos*h; /* hd must be even — all standard archs are */
-    for (int i = 0; i < h; i++) {
-        float x0 = v[i], x1 = v[i+h];
-        v[i] = x0*cc[off+i] - x1*sc[off+i];
-        v[i+h] = x0*sc[off+i] + x1*cc[off+i];
+    if (norm_pairs) {
+        for (int i = 0; i < h; i++) {
+            int j = 2*i;
+            float x0 = v[j], x1 = v[j+1];
+            v[j]   = x0*cc[off+i] - x1*sc[off+i];
+            v[j+1] = x0*sc[off+i] + x1*cc[off+i];
+        }
+    } else {
+        for (int i = 0; i < h; i++) {
+            float x0 = v[i], x1 = v[i+h];
+            v[i] = x0*cc[off+i] - x1*sc[off+i];
+            v[i+h] = x0*sc[off+i] + x1*cc[off+i];
+        }
     }
 }
 
@@ -2785,8 +2801,9 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
                 if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
                 else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
-                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta);
-                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta);
+                int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
                 nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
                 nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
@@ -2889,8 +2906,9 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
                 else         nt_metal_q4k_matvec_slot(SLOT_K,(const uint8_t*)ps->host_layers[l].wk,SLOT_FN,kd,D);
                 if (vd==14)  nt_metal_q6k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
                 else         nt_metal_q4k_matvec_slot(SLOT_V,(const uint8_t*)ps->host_layers[l].wv,SLOT_FN,kd,D);
-                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta);
-                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta);
+                int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+                nt_metal_rope(SLOT_Q, ps->host_heads,    hd, pos, ps->rope_theta, rope_norm);
+                nt_metal_rope(SLOT_K, ps->host_kv_heads, hd, pos, ps->rope_theta, rope_norm);
                 nt_metal_copy_to_region(s->key_cache   + co2, SLOT_K, kd*4);
                 nt_metal_copy_to_region(s->value_cache + co2, SLOT_V, kd*4);
                 nt_metal_attn_decode(SLOT_O, SLOT_Q, Kbase, Vbase, pos+1,
@@ -2928,8 +2946,9 @@ static float *doe_forward(GGUFIndex *ps, InferState *s, int token, int pos) {
         if (ps->host_layers[l].bk) for (int i = 0; i < kd; i++) s->k[i] += ps->host_layers[l].bk[i];
         if (ps->host_layers[l].bv) for (int i = 0; i < kd; i++) s->v[i] += ps->host_layers[l].bv[i];
 
-        for (int h = 0; h < ps->host_heads; h++) apply_rope(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd);
-        for (int h = 0; h < ps->host_kv_heads; h++) apply_rope(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd);
+        int rope_norm = g_rope_norm || strcmp(ps->host_arch, "llama") == 0;
+        for (int h = 0; h < ps->host_heads; h++) apply_rope_mode(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
+        for (int h = 0; h < ps->host_kv_heads; h++) apply_rope_mode(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd, rope_norm);
 
         int co = l * s->max_seq * kd + pos * kd;
         memcpy(s->key_cache + co, s->k, kd*4);
@@ -3570,7 +3589,7 @@ static void chat(GGUFIndex *ps) {
         struct timespec _gt0, _gt1; clock_gettime(CLOCK_MONOTONIC, &_gt0); int _gi = 0;
         g_prof_mv_ns = 0; g_resident_ns = 0; g_head_ns = 0; /* reset: profile over decode loop only (exclude prefill) */
         for (int _g = 0; _g < MVG_N; _g++) { g_ps_ns[_g] = 0; g_ps_cnt[_g] = 0; }
-        for (int i = 0; i < 200 && pos < max_seq; i++, pos++) {
+        for (int i = 0; i < g_gen_max_new && pos < max_seq; i++, pos++) {
             _gi = i + 1;
             float *lg = doe_forward(ps, &is, prev, pos);
 
@@ -3608,7 +3627,8 @@ static void chat(GGUFIndex *ps) {
                 }
             }
 
-            int next = sample(lg, ps->host_vocab, F.effective_temp, 40);
+            float sample_temp = g_gen_temp_override >= 0.0f ? g_gen_temp_override : F.effective_temp;
+            int next = sample(lg, ps->host_vocab, sample_temp, g_gen_top_k);
             if (n_rep < 256) rep_hist[n_rep++] = next;
 
             /* Stop on EOS or chat-template end tokens */
@@ -3703,6 +3723,7 @@ static void chat(GGUFIndex *ps) {
         if (total_births > 0 || total_deaths > 0)
             printf("  [life] births=%d deaths=%d\n", total_births, total_deaths);
         printf("\n");
+        if (g_once) break;
     }
     free_infer(&is);
 }
@@ -4091,6 +4112,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--rep-penalty") == 0 && i+1 < argc) { g_rep_penalty = atof(argv[++i]); if (g_rep_penalty <= 0.0f) g_rep_penalty = 1.0f; }
         else if (strcmp(argv[i], "--field-gain") == 0 && i+1 < argc) { g_field_gain = atof(argv[++i]); if (g_field_gain < 0.0f) g_field_gain = 0.0f; }
         else if (strcmp(argv[i], "--train") == 0 && i+1 < argc) { g_train = atoi(argv[++i]) ? 1 : 0; }
+        else if (strcmp(argv[i], "--max-new") == 0 && i+1 < argc) { g_gen_max_new = atoi(argv[++i]); if (g_gen_max_new < 1) g_gen_max_new = 1; if (g_gen_max_new > 512) g_gen_max_new = 512; }
+        else if (strcmp(argv[i], "--top-k") == 0 && i+1 < argc) { g_gen_top_k = atoi(argv[++i]); if (g_gen_top_k < 0) g_gen_top_k = 0; }
+        else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) { g_gen_temp_override = atof(argv[++i]); if (g_gen_temp_override < 0.0f) g_gen_temp_override = -1.0f; }
+        else if (strcmp(argv[i], "--once") == 0) { g_once = 1; }
+        else if (strcmp(argv[i], "--rope-norm") == 0) { g_rope_norm = 1; }
+        else if (strcmp(argv[i], "--no-load-spore") == 0) { g_load_spore = 0; }
+        else if (strcmp(argv[i], "--no-save-spore") == 0) { g_save_spore = 0; }
         else if (strcmp(argv[i], "--prophecy") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--destiny") == 0 && i+1 < argc) { /* will be set after field_init */ }
         else if (strcmp(argv[i], "--serve") == 0 && i+1 < argc) { g_serve_port = atoi(argv[++i]); }
@@ -4106,6 +4134,13 @@ int main(int argc, char **argv) {
             printf("  --rep-penalty F repetition penalty over GENERATED tokens (default: 1.0 = off; 1.05 polishes demo tail)\n");
             printf("  --field-gain F  scale Dario field overlay on logits (default: 1.0; 0 = bare host)\n");
             printf("  --train N       notorch online-learning during inference (default: 0 = off; 1 = on)\n\n");
+            printf("  --max-new N     max generated tokens in chat mode (default: 200)\n");
+            printf("  --top-k N       chat sampler top-k (default: 40; 1 with --temp 0 matches greedy probes)\n");
+            printf("  --temp F        override chat sampler temperature (default: field temperature; 0 = greedy)\n");
+            printf("  --once          exit after one generated answer (for artifact-isolation probes)\n\n");
+            printf("  --rope-norm     probe llama.cpp NORM RoPE (consecutive head pairs)\n");
+            printf("  --no-load-spore skip mycelium restore for isolated probes\n");
+            printf("  --no-save-spore skip mycelium persist on exit for isolated probes\n\n");
             printf("  BLAS: cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe\n");
             printf("  GPU:  cc doe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o doe\n");
             return 0;
@@ -4251,7 +4286,7 @@ int main(int argc, char **argv) {
     /* ── Mycelium — check for existing LoRA spores ── */
     MyceliumState mycelium;
     mycelium_init(&mycelium);
-    if (mycelium_load(&idx, idx.profile.fingerprint))
+    if (g_load_spore && mycelium_load(&idx, idx.profile.fingerprint))
         printf("[mycelium] resumed adaptation for this index.\n");
 
 #ifdef USE_METAL
@@ -4277,7 +4312,7 @@ int main(int argc, char **argv) {
     }
 
     /* ── Save spore on exit ── */
-    mycelium_save(&idx, F.step, F.field_health);
+    if (g_save_spore) mycelium_save(&idx, F.step, F.field_health);
 
     /* ── Cleanup ── */
     index_free(&idx);
