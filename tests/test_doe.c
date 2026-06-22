@@ -1200,7 +1200,7 @@ static void test_rope_position_zero(void) {
     int hd = 4;
     float cc[2] = {1.0f, 1.0f};
     float sc[2] = {0.0f, 0.0f};
-    apply_rope(v, 0, cc, sc, hd);
+    apply_rope_mode(v, 0, cc, sc, hd, 0); /* 0 = half-split (old apply_rope path); identity at pos 0 */
     ASSERT_FLOAT_EQ(v[0], 1.0f, 1e-5f, "rope pos=0 should preserve v[0]");
     ASSERT_FLOAT_EQ(v[1], 2.0f, 1e-5f, "rope pos=0 should preserve v[1]");
     ASSERT_FLOAT_EQ(v[2], 3.0f, 1e-5f, "rope pos=0 should preserve v[2]");
