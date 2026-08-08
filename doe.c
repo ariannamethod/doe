@@ -1390,12 +1390,56 @@ static void pq_i8_range(void *ctx, int r0, int r1) {
     PQI8Ctx *w = (PQI8Ctx *)ctx; w->fn(w->out, w->Wq, w->qa, w->da, r0, r1, w->c);
 }
 
+/* Quantized-activation scratch, reused across calls.
+ *
+ * Two costs were being paid 197 times per token, once per dispatch. The first was
+ * malloc/free for qa and da. The second is larger and less obvious: consecutive
+ * projections share their input. Q, K and V all consume the same post-norm vector, and
+ * gate and up consume the same one — so the activation was being quantized four times
+ * per layer where once would do, and quantization is lrintf per element.
+ *
+ * Caching on the pointer alone would be wrong: a caller may refill the same buffer with
+ * different contents between calls, and the failure would be a silently stale
+ * quantization rather than a crash. So the cache keeps a COPY of the activation it
+ * quantized and validates with memcmp. That is exact, and it costs about a tenth of
+ * re-quantizing — memcmp streams, lrintf does not.
+ *
+ * Thread-local because the caller-parallel entry may dispatch matvecs from several
+ * threads; per-thread scratch removes the question rather than answering it. */
+typedef struct {
+    float  *x;      /* copy of the activation these tables were built from */
+    int8_t *qa;
+    float  *da;
+    int cap_c, c, valid;
+} pq_qcache_t;
+static __thread pq_qcache_t g_qc = { NULL, NULL, NULL, 0, 0, 0 };
+
+static int pq_qcache_get(const float *x, int c, int8_t **qa_out, float **da_out) {
+    int nb = c / 32;
+    if (g_qc.valid && g_qc.c == c && memcmp(g_qc.x, x, (size_t)c * sizeof(float)) == 0) {
+        *qa_out = g_qc.qa; *da_out = g_qc.da; return 1;          /* hit — same vector */
+    }
+    if (c > g_qc.cap_c) {
+        float  *nx = (float *)realloc(g_qc.x,  (size_t)c * sizeof(float));
+        int8_t *nq = (int8_t *)realloc(g_qc.qa, (size_t)c);
+        float  *nd = (float *)realloc(g_qc.da, (size_t)nb * sizeof(float));
+        if (!nx || !nq || !nd) {                                  /* keep what survived */
+            if (nx) g_qc.x = nx; if (nq) g_qc.qa = nq; if (nd) g_qc.da = nd;
+            g_qc.valid = 0; return -1;
+        }
+        g_qc.x = nx; g_qc.qa = nq; g_qc.da = nd; g_qc.cap_c = c;
+    }
+    memcpy(g_qc.x, x, (size_t)c * sizeof(float));
+    pq_quant_act_q8(x, c, g_qc.qa, g_qc.da);
+    g_qc.c = c; g_qc.valid = 1;
+    *qa_out = g_qc.qa; *da_out = g_qc.da; return 0;
+}
+
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
     pq_i8_fn kern = (dt == 2) ? pq_q4_0_rows_i8 : (dt == 8) ? pq_q8_0_rows_i8 : NULL;
     if (!kern || (c%32)) return -1;
-    int nb=c/32; int8_t *qa=(int8_t*)malloc((size_t)c); float *da=(float*)malloc((size_t)nb*sizeof(float));
-    if (!qa || !da) { free(qa); free(da); return -1; }
-    pq_quant_act_q8(x, c, qa, da);
+    int8_t *qa; float *da;
+    if (pq_qcache_get(x, c, &qa, &da) < 0) return -1;
     /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
      * single core regardless of --threads, which is why the int8 "fast path" measured
      * slower than it should. It threads like its f32 twin now. */
@@ -1406,7 +1450,7 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
         PQI8Ctx ctx = { kern, out, Wq, qa, da, c };
         pq_run(pq_i8_range, &ctx, r, nt);
     }
-    free(qa); free(da); return 0;
+    return 0;                                   /* scratch is owned by the cache */
 }
 
 /* matvec dispatch: packed weight (dt != 0) -> doe_qmatvec (inline dequant);
