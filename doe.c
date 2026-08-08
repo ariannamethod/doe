@@ -1351,13 +1351,48 @@ static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
         out[row]=a; }
 }
 #endif
-typedef struct { float *out; const uint8_t *Wq; const int8_t *qa; const float *da; int c; } PQI8Ctx;
+/* Q8_0 int8-dot rows: 34 B per 32 values — an f16 scale then 32 raw int8 weights.
+ * Unlike Q4_0 there is nothing to unpack, the dot is int8 x int8 straight through and
+ * the per-block result is scaled once by d_w * d_a. Ported from notorch
+ * nt_q8_0_rows_i8.
+ *
+ * Why it matters here: lm_head is stored Q8_0, and dt=8 was rejected by the int8
+ * dispatch, so the single largest shape in the model fell back to the exact
+ * dequant-inline path. Measured on a 1.5B host after the pool landed, the Q4_0 shapes
+ * were reading weights at 12-13 GB/s — the memory ceiling of this device — while
+ * lm_head crawled at 4.3 GB/s and took 48% of decode on its own. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *wq=(const int8_t*)(bl+2), *qab=qa+(size_t)b*32;
+            int32x4_t s=vdupq_n_s32(0);
+            s=vdotq_s32(s,vld1q_s8(wq),vld1q_s8(qab)); s=vdotq_s32(s,vld1q_s8(wq+16),vld1q_s8(qab+16));
+            a += d*da[b]*(float)vaddvq_s32(s); }
+        out[row]=a; }
+}
+#else
+static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+    int nb=c/32;
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
+        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+            const int8_t *wq=(const int8_t*)(bl+2), *qab=qa+(size_t)b*32; int32_t s=0;
+            for (int i=0;i<32;i++) s += (int32_t)wq[i]*(int32_t)qab[i];
+            a += d*da[b]*(float)s; }
+        out[row]=a; }
+}
+#endif
+
+typedef void (*pq_i8_fn)(float *, const uint8_t *, const int8_t *, const float *, int, int, int);
+typedef struct { pq_i8_fn fn; float *out; const uint8_t *Wq; const int8_t *qa; const float *da; int c; } PQI8Ctx;
 static void pq_i8_range(void *ctx, int r0, int r1) {
-    PQI8Ctx *w = (PQI8Ctx *)ctx; pq_q4_0_rows_i8(w->out, w->Wq, w->qa, w->da, r0, r1, w->c);
+    PQI8Ctx *w = (PQI8Ctx *)ctx; w->fn(w->out, w->Wq, w->qa, w->da, r0, r1, w->c);
 }
 
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
-    if (dt != 2 || (c%32)) return -1;
+    pq_i8_fn kern = (dt == 2) ? pq_q4_0_rows_i8 : (dt == 8) ? pq_q8_0_rows_i8 : NULL;
+    if (!kern || (c%32)) return -1;
     int nb=c/32; int8_t *qa=(int8_t*)malloc((size_t)c); float *da=(float*)malloc((size_t)nb*sizeof(float));
     if (!qa || !da) { free(qa); free(da); return -1; }
     pq_quant_act_q8(x, c, qa, da);
@@ -1366,9 +1401,9 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
      * slower than it should. It threads like its f32 twin now. */
     int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
     if (nt <= 1 || (long)r*c < (1L<<20)) {
-        pq_q4_0_rows_i8(out, Wq, qa, da, 0, r, c);
+        kern(out, Wq, qa, da, 0, r, c);
     } else {
-        PQI8Ctx ctx = { out, Wq, qa, da, c };
+        PQI8Ctx ctx = { kern, out, Wq, qa, da, c };
         pq_run(pq_i8_range, &ctx, r, nt);
     }
     free(qa); free(da); return 0;
