@@ -34,6 +34,8 @@
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <float.h>
@@ -1232,42 +1234,77 @@ static pq_fn pq_for(int dt, int c) {
  * which worker claims which chunk cannot move a bit of the result. */
 typedef void (*pq_range_fn)(void *ctx, int r0, int r1);
 
+/* The handshake is atomic, not condvar-based, and that is the point.
+ *
+ * A condvar dispatch costs a futex wake plus scheduler latency on every job — tens of
+ * microseconds, paid 197 times per token, which is milliseconds of the ~76 ms budget
+ * spent waking threads rather than reading weights. Workers therefore spin on a
+ * generation counter first and only fall asleep if no job arrives within PQ_SPIN
+ * iterations. Between dispatches the gap is a fraction of a millisecond, so the spin is
+ * almost always productive; the sleep path exists so an idle phone is not held awake.
+ *
+ * Chunk claiming is a single fetch_add, and the completion barrier is a spin on the
+ * busy counter, so a dispatch touches no mutex at all on the hot path. The dispatcher
+ * still takes the lock to broadcast, which is uncontended and lets a sleeping worker be
+ * woken without a lost-wakeup race — the sleeper re-checks the generation under the same
+ * lock before waiting. PQ_SPIN can be overridden with DOE_SPIN for measurement. */
 typedef struct {
     pthread_mutex_t mu;
-    pthread_cond_t  work, done;
+    pthread_cond_t  work;
     pq_range_fn fn; void *ctx;
-    int m, chunk, next, busy, gen;
-    int nthreads, started, shutdown;
+    int m, chunk;
+    _Atomic int next, busy, gen, shutdown;
+    int nthreads, started;
     pthread_t th[32];
 } pq_pool_t;
 
 static pq_pool_t g_pq = {
-    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
     NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, { 0 }
 };
+static int g_pq_spin = -1;
+static void pq_spin_init(void) {
+    if (g_pq_spin >= 0) return;
+    const char *e = getenv("DOE_SPIN");
+    g_pq_spin = (e && atoi(e) >= 0) ? atoi(e) : 20000;
+}
+#if defined(__aarch64__) || defined(__arm__)
+#define PQ_PAUSE() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
+#define PQ_PAUSE() __asm__ __volatile__("pause" ::: "memory")
+#else
+#define PQ_PAUSE() ((void)0)
+#endif
+
+/* Drain chunks until the job is exhausted. Shared by the workers and the caller. */
+static void pq_drain(pq_range_fn fn, void *ctx, int m, int ch) {
+    for (;;) {
+        int r0 = atomic_fetch_add_explicit(&g_pq.next, ch, memory_order_relaxed);
+        if (r0 >= m) break;
+        int r1 = r0 + ch; if (r1 > m) r1 = m;
+        fn(ctx, r0, r1);
+    }
+}
 
 static void *pq_pool_worker(void *arg) {
     (void)arg;
     int seen = 0;
     for (;;) {
-        pthread_mutex_lock(&g_pq.mu);
-        while (!g_pq.shutdown && g_pq.gen == seen) pthread_cond_wait(&g_pq.work, &g_pq.mu);
-        if (g_pq.shutdown) { pthread_mutex_unlock(&g_pq.mu); return NULL; }
-        seen = g_pq.gen;
-        pq_range_fn fn = g_pq.fn; void *ctx = g_pq.ctx; int m = g_pq.m, ch = g_pq.chunk;
-        pthread_mutex_unlock(&g_pq.mu);
-
+        int spins = 0;
         for (;;) {
-            pthread_mutex_lock(&g_pq.mu);
-            int r0 = g_pq.next; g_pq.next += ch;
+            if (atomic_load_explicit(&g_pq.shutdown, memory_order_relaxed)) return NULL;
+            if (atomic_load_explicit(&g_pq.gen, memory_order_acquire) != seen) break;
+            if (++spins < g_pq_spin) { PQ_PAUSE(); continue; }
+            pthread_mutex_lock(&g_pq.mu);                 /* re-check under the lock so */
+            if (atomic_load_explicit(&g_pq.gen, memory_order_acquire) == seen &&
+                !atomic_load_explicit(&g_pq.shutdown, memory_order_relaxed))
+                pthread_cond_wait(&g_pq.work, &g_pq.mu);  /* a wake cannot be lost      */
             pthread_mutex_unlock(&g_pq.mu);
-            if (r0 >= m) break;
-            int r1 = r0 + ch; if (r1 > m) r1 = m;
-            fn(ctx, r0, r1);
+            spins = 0;
         }
-        pthread_mutex_lock(&g_pq.mu);
-        if (--g_pq.busy == 0) pthread_cond_signal(&g_pq.done);
-        pthread_mutex_unlock(&g_pq.mu);
+        seen = atomic_load_explicit(&g_pq.gen, memory_order_acquire);
+        pq_drain(g_pq.fn, g_pq.ctx, g_pq.m, g_pq.chunk);
+        atomic_fetch_sub_explicit(&g_pq.busy, 1, memory_order_release);
     }
 }
 
@@ -1275,33 +1312,36 @@ static void *pq_pool_worker(void *arg) {
  * few enough that the dispatch lock is nowhere near the critical path. */
 static void pq_run(pq_range_fn fn, void *ctx, int m, int nt) {
     if (nt <= 1) { fn(ctx, 0, m); return; }
-    pthread_mutex_lock(&g_pq.mu);
+    pq_spin_init();
     if (!g_pq.started) {
-        g_pq.nthreads = 1;
-        for (int i = 0; i < nt - 1 && i < 31; i++) {
-            if (pthread_create(&g_pq.th[i], NULL, pq_pool_worker, NULL) != 0) break;
-            g_pq.nthreads++;
+        pthread_mutex_lock(&g_pq.mu);
+        if (!g_pq.started) {
+            g_pq.nthreads = 1;
+            for (int i = 0; i < nt - 1 && i < 31; i++) {
+                if (pthread_create(&g_pq.th[i], NULL, pq_pool_worker, NULL) != 0) break;
+                g_pq.nthreads++;
+            }
+            g_pq.started = 1;
         }
-        g_pq.started = 1;
+        pthread_mutex_unlock(&g_pq.mu);
     }
     int workers = g_pq.nthreads - 1;
     int ch = m / (g_pq.nthreads * 16); if (ch < 1) ch = 1;
     g_pq.fn = fn; g_pq.ctx = ctx; g_pq.m = m; g_pq.chunk = ch;
-    g_pq.next = 0; g_pq.busy = workers; g_pq.gen++;
+    atomic_store_explicit(&g_pq.next, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_pq.busy, workers, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pq.gen, 1, memory_order_release);
+    pthread_mutex_lock(&g_pq.mu);            /* uncontended; wakes anyone who slept */
     pthread_cond_broadcast(&g_pq.work);
     pthread_mutex_unlock(&g_pq.mu);
 
-    for (;;) {                                   /* the caller drains chunks too */
-        pthread_mutex_lock(&g_pq.mu);
-        int r0 = g_pq.next; g_pq.next += ch;
-        pthread_mutex_unlock(&g_pq.mu);
-        if (r0 >= m) break;
-        int r1 = r0 + ch; if (r1 > m) r1 = m;
-        fn(ctx, r0, r1);
+    pq_drain(fn, ctx, m, ch);                /* the caller is a worker too */
+
+    int spins = 0;
+    while (atomic_load_explicit(&g_pq.busy, memory_order_acquire) > 0) {
+        if (++spins < g_pq_spin) { PQ_PAUSE(); continue; }
+        sched_yield(); spins = 0;
     }
-    pthread_mutex_lock(&g_pq.mu);
-    while (g_pq.busy > 0) pthread_cond_wait(&g_pq.done, &g_pq.mu);
-    pthread_mutex_unlock(&g_pq.mu);
 }
 
 typedef struct { pq_fn fn; float *out; const uint8_t *Wq; const float *x; int c; } PQCtx;
