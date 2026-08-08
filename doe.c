@@ -1215,8 +1215,99 @@ static pq_fn pq_for(int dt, int c) {
     }
     return NULL;
 }
-typedef struct { pq_fn fn; float *out; const uint8_t *Wq; const float *x; int r0,r1,c; } PQWork;
-static void *pq_worker(void *arg) { PQWork *w=(PQWork*)arg; w->fn(w->out,w->Wq,w->x,w->r0,w->r1,w->c); return NULL; }
+/* ── persistent worker pool for row-range kernels ────────────────────────────────
+ * Both packed matvecs used to pthread_create/pthread_join on EVERY call. A 28-layer
+ * decode issues ~197 of them per token (112 attn_qkv + 56 ffn_gate_up + 28 ffn_down
+ * + 1 lm_head, measured with DOE_PERSHAPE on a 1.5B Q4_0), so ~800 thread creations
+ * were paid before a single weight byte was read.
+ *
+ * The split was also even — chunk = (r + nt - 1) / nt — which assumes equal workers.
+ * On a big.LITTLE phone that is false: a Cortex-A520 spends about three times as long
+ * per row as the prime A720, so the fast cores idle waiting for the slow one. Measured
+ * on a 32000x2048 head: 8.29 ms split evenly across all eight cores against 3.41 ms
+ * once rows were handed out on demand.
+ *
+ * Workers are created once and pull row chunks until the job is drained; the caller is
+ * a worker too. Rows are disjoint and each row's accumulation is self-contained, so
+ * which worker claims which chunk cannot move a bit of the result. */
+typedef void (*pq_range_fn)(void *ctx, int r0, int r1);
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  work, done;
+    pq_range_fn fn; void *ctx;
+    int m, chunk, next, busy, gen;
+    int nthreads, started, shutdown;
+    pthread_t th[32];
+} pq_pool_t;
+
+static pq_pool_t g_pq = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, { 0 }
+};
+
+static void *pq_pool_worker(void *arg) {
+    (void)arg;
+    int seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_pq.mu);
+        while (!g_pq.shutdown && g_pq.gen == seen) pthread_cond_wait(&g_pq.work, &g_pq.mu);
+        if (g_pq.shutdown) { pthread_mutex_unlock(&g_pq.mu); return NULL; }
+        seen = g_pq.gen;
+        pq_range_fn fn = g_pq.fn; void *ctx = g_pq.ctx; int m = g_pq.m, ch = g_pq.chunk;
+        pthread_mutex_unlock(&g_pq.mu);
+
+        for (;;) {
+            pthread_mutex_lock(&g_pq.mu);
+            int r0 = g_pq.next; g_pq.next += ch;
+            pthread_mutex_unlock(&g_pq.mu);
+            if (r0 >= m) break;
+            int r1 = r0 + ch; if (r1 > m) r1 = m;
+            fn(ctx, r0, r1);
+        }
+        pthread_mutex_lock(&g_pq.mu);
+        if (--g_pq.busy == 0) pthread_cond_signal(&g_pq.done);
+        pthread_mutex_unlock(&g_pq.mu);
+    }
+}
+
+/* ~16 chunks per worker: enough granularity for a 3x-slower core to simply take fewer,
+ * few enough that the dispatch lock is nowhere near the critical path. */
+static void pq_run(pq_range_fn fn, void *ctx, int m, int nt) {
+    if (nt <= 1) { fn(ctx, 0, m); return; }
+    pthread_mutex_lock(&g_pq.mu);
+    if (!g_pq.started) {
+        g_pq.nthreads = 1;
+        for (int i = 0; i < nt - 1 && i < 31; i++) {
+            if (pthread_create(&g_pq.th[i], NULL, pq_pool_worker, NULL) != 0) break;
+            g_pq.nthreads++;
+        }
+        g_pq.started = 1;
+    }
+    int workers = g_pq.nthreads - 1;
+    int ch = m / (g_pq.nthreads * 16); if (ch < 1) ch = 1;
+    g_pq.fn = fn; g_pq.ctx = ctx; g_pq.m = m; g_pq.chunk = ch;
+    g_pq.next = 0; g_pq.busy = workers; g_pq.gen++;
+    pthread_cond_broadcast(&g_pq.work);
+    pthread_mutex_unlock(&g_pq.mu);
+
+    for (;;) {                                   /* the caller drains chunks too */
+        pthread_mutex_lock(&g_pq.mu);
+        int r0 = g_pq.next; g_pq.next += ch;
+        pthread_mutex_unlock(&g_pq.mu);
+        if (r0 >= m) break;
+        int r1 = r0 + ch; if (r1 > m) r1 = m;
+        fn(ctx, r0, r1);
+    }
+    pthread_mutex_lock(&g_pq.mu);
+    while (g_pq.busy > 0) pthread_cond_wait(&g_pq.done, &g_pq.mu);
+    pthread_mutex_unlock(&g_pq.mu);
+}
+
+typedef struct { pq_fn fn; float *out; const uint8_t *Wq; const float *x; int c; } PQCtx;
+static void pq_range(void *ctx, int r0, int r1) {
+    PQCtx *w = (PQCtx *)ctx; w->fn(w->out, w->Wq, w->x, r0, r1, w->c);
+}
 
 /* out[r] = Wq[r,c] @ x[c], weights packed. Returns 0 ok, -1 if dtype unsupported. */
 static int doe_qmatvec(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
@@ -1224,10 +1315,8 @@ static int doe_qmatvec(float *out, const uint8_t *Wq, int dt, const float *x, in
     if (!fn) return -1;
     int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
     if (nt <= 1 || (long)r*c < (1L<<20)) { fn(out, Wq, x, 0, r, c); return 0; }
-    pthread_t thr[32]; PQWork work[32]; int chunk=(r+nt-1)/nt, actual=0;
-    for (int t=0;t<nt;t++) { int r0=t*chunk, r1=r0+chunk; if (r0>=r) break; if (r1>r) r1=r;
-        work[t]=(PQWork){fn,out,Wq,x,r0,r1,c}; pthread_create(&thr[t],NULL,pq_worker,&work[t]); actual++; }
-    for (int t=0;t<actual;t++) pthread_join(thr[t],NULL);
+    PQCtx ctx = { fn, out, Wq, x, c };
+    pq_run(pq_range, &ctx, r, nt);
     return 0;
 }
 
@@ -1262,12 +1351,26 @@ static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
         out[row]=a; }
 }
 #endif
+typedef struct { float *out; const uint8_t *Wq; const int8_t *qa; const float *da; int c; } PQI8Ctx;
+static void pq_i8_range(void *ctx, int r0, int r1) {
+    PQI8Ctx *w = (PQI8Ctx *)ctx; pq_q4_0_rows_i8(w->out, w->Wq, w->qa, w->da, r0, r1, w->c);
+}
+
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
     if (dt != 2 || (c%32)) return -1;
     int nb=c/32; int8_t *qa=(int8_t*)malloc((size_t)c); float *da=(float*)malloc((size_t)nb*sizeof(float));
     if (!qa || !da) { free(qa); free(da); return -1; }
     pq_quant_act_q8(x, c, qa, da);
-    pq_q4_0_rows_i8(out, Wq, qa, da, 0, r, c);
+    /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
+     * single core regardless of --threads, which is why the int8 "fast path" measured
+     * slower than it should. It threads like its f32 twin now. */
+    int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
+    if (nt <= 1 || (long)r*c < (1L<<20)) {
+        pq_q4_0_rows_i8(out, Wq, qa, da, 0, r, c);
+    } else {
+        PQI8Ctx ctx = { out, Wq, qa, da, c };
+        pq_run(pq_i8_range, &ctx, r, nt);
+    }
     free(qa); free(da); return 0;
 }
 
