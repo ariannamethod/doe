@@ -1673,14 +1673,42 @@ static void pq_q5_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
     const uint8x16_t m0f = vdupq_n_u8(0x0F), hbit = vdupq_n_u8(0x10);
     const uint8_t pow2[16] = { 1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128 };
     const uint8x16_t pw = vld1q_u8(pow2);
+    /* Four blocks retired together: the per-block vaddvq_s32 is a full horizontal
+     * reduction in the dependency chain, and four of them collapse into two pairwise
+     * vpaddq_s32. The float accumulation order is unchanged, block by block ascending,
+     * so this stays bit-identical. Same treatment Q4_0 already got. */
     for (int row = r0; row < r1; row++) {
         const uint8_t *rb = W + (size_t)row * nb * 22;
-        float a = 0;
-        for (int b = 0; b < nb; b++) {
+        float a = 0; int b = 0;
+        for (; b + 4 <= nb; b += 4) {
+            int32x4_t s0, s1, s2, s3; float dv[4]; int32x4_t *sp[4] = { &s0, &s1, &s2, &s3 };
+            for (int j = 0; j < 4; j++) {
+                const uint8_t *bl = rb + (size_t)(b + j) * 22;
+                dv[j] = f16_to_f32((uint16_t)(bl[0] | (bl[1] << 8)));
+                uint8x16_t qh_a = vcombine_u8(vdup_n_u8(bl[2]), vdup_n_u8(bl[3]));
+                uint8x16_t qh_b = vcombine_u8(vdup_n_u8(bl[4]), vdup_n_u8(bl[5]));
+                uint8x16_t h0 = vandq_u8(vtstq_u8(qh_a, pw), hbit);
+                uint8x16_t h1 = vandq_u8(vtstq_u8(qh_b, pw), hbit);
+                uint8x16_t pk = vld1q_u8(bl + 6);
+                int8x16_t lo = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(pk, m0f), h0));
+                int8x16_t hi = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(pk, 4), h1));
+                const int8_t *qab = qa + (size_t)(b + j) * 32;
+                int32x4_t t = vdupq_n_s32(0);
+                t = vdotq_s32(t, lo, vld1q_s8(qab));
+                t = vdotq_s32(t, hi, vld1q_s8(qab + 16));
+                *sp[j] = t;
+            }
+            int32_t sums[4]; vst1q_s32(sums, vpaddq_s32(vpaddq_s32(s0, s1), vpaddq_s32(s2, s3)));
+            a += dv[0] * da[b+0] * (float)(sums[0] - 16 * as[b+0]);
+            a += dv[1] * da[b+1] * (float)(sums[1] - 16 * as[b+1]);
+            a += dv[2] * da[b+2] * (float)(sums[2] - 16 * as[b+2]);
+            a += dv[3] * da[b+3] * (float)(sums[3] - 16 * as[b+3]);
+        }
+        for (; b < nb; b++) {
             const uint8_t *bl = rb + (size_t)b * 22;
             float d = f16_to_f32((uint16_t)(bl[0] | (bl[1] << 8)));
-            uint8x16_t qh_a = vcombine_u8(vdup_n_u8(bl[2]), vdup_n_u8(bl[3]));  /* lanes 0-15 */
-            uint8x16_t qh_b = vcombine_u8(vdup_n_u8(bl[4]), vdup_n_u8(bl[5]));  /* lanes 16-31 */
+            uint8x16_t qh_a = vcombine_u8(vdup_n_u8(bl[2]), vdup_n_u8(bl[3]));
+            uint8x16_t qh_b = vcombine_u8(vdup_n_u8(bl[4]), vdup_n_u8(bl[5]));
             uint8x16_t h0 = vandq_u8(vtstq_u8(qh_a, pw), hbit);
             uint8x16_t h1 = vandq_u8(vtstq_u8(qh_b, pw), hbit);
             uint8x16_t pk = vld1q_u8(bl + 6);
