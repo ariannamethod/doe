@@ -1669,6 +1669,7 @@ static void pq_q4_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
 /* byte -> eight lanes, each 0x10 where the bit is set. Two loads from this replace the
  * vdup/vcombine/vtst/and quartet the high-bit expansion used to cost per half-block; the
  * table is 2 KB and stays resident. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static const uint64_t pq_q5_hi[256] = {
     0x0000000000000000ULL, 0x0000000000000010ULL, 0x0000000000001000ULL, 0x0000000000001010ULL,
     0x0000000000100000ULL, 0x0000000000100010ULL, 0x0000000000101000ULL, 0x0000000000101010ULL,
@@ -1735,6 +1736,7 @@ static const uint64_t pq_q5_hi[256] = {
     0x1010101010000000ULL, 0x1010101010000010ULL, 0x1010101010001000ULL, 0x1010101010001010ULL,
     0x1010101010100000ULL, 0x1010101010100010ULL, 0x1010101010101000ULL, 0x1010101010101010ULL,
 };
+#endif
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static void pq_q5_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
