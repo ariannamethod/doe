@@ -1567,6 +1567,87 @@ static void pq_q6_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
 }
 #endif
 
+/* Q4_K int8-dot rows: 144 B per 256 values. Ported from notorch nt_q4_k_rows_i8.
+ *
+ * No sign trick is needed, for a different reason than Q6_K: the nibble is already
+ * unsigned [0,15] and 15 is representable in int8, so reinterpreting it as signed is the
+ * identity and plain SDOT is exact. USDOT would also serve but is an i8mm instruction,
+ * and this kernel has no reason to demand the wider baseline.
+ *
+ * The affine format gives w = d*ls*q - dmin*lm, so SUM(w*x) is
+ * da[s] * (d*ls*SUM(q*qa) - dmin*lm*SUM(qa)). The minus term depends only on the
+ * activation, and SUM(qa) per 32-block already arrives from the quantizer through the
+ * cache — notorch recomputes it per call, this does not.
+ *
+ * One 32-byte weight load feeds two sub-blocks: low nibbles the even one, high nibbles
+ * the odd one, which is the pairing the scalar path writes as (j >> 1). The float tail is
+ * the scalar one verbatim, ascending by sub-block, so the two agree bit for bit. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void pq_q4_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    int nb = c / 256;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (size_t)row * nb * 144;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (size_t)blk * 144;
+            float d    = f16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+            float dmin = f16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+            const uint8_t *sc = b + 4, *qs = b + 16;
+            int32_t dots[8];
+            for (int p = 0; p < 4; p++) {
+                uint8x16_t q0 = vld1q_u8(qs + p * 32);
+                uint8x16_t q1 = vld1q_u8(qs + p * 32 + 16);
+                const int8_t *a0 = qa + (size_t)(blk * 8 + 2 * p) * 32;
+                const int8_t *a1 = qa + (size_t)(blk * 8 + 2 * p + 1) * 32;
+                const int32x4_t z = vdupq_n_s32(0);
+                int32x4_t e = vdotq_s32(z, vreinterpretq_s8_u8(vandq_u8(q0, m4)), vld1q_s8(a0));
+                e = vdotq_s32(e, vreinterpretq_s8_u8(vandq_u8(q1, m4)), vld1q_s8(a0 + 16));
+                int32x4_t o = vdotq_s32(z, vreinterpretq_s8_u8(vshrq_n_u8(q0, 4)), vld1q_s8(a1));
+                o = vdotq_s32(o, vreinterpretq_s8_u8(vshrq_n_u8(q1, 4)), vld1q_s8(a1 + 16));
+                dots[2 * p]     = vaddvq_s32(e);
+                dots[2 * p + 1] = vaddvq_s32(o);
+            }
+            for (int j = 0; j < 8; j++) {
+                uint8_t s6, m6; get_scale_min_k4(j, sc, &s6, &m6);
+                int sub = blk * 8 + j;
+                acc += da[sub] * (d * (float)s6 * (float)dots[j]
+                                - dmin * (float)m6 * (float)as[sub]);
+            }
+        }
+        out[row] = acc;
+    }
+}
+#else
+static void pq_q4_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    int nb = c / 256;
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (size_t)row * nb * 144;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (size_t)blk * 144;
+            float d    = f16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+            float dmin = f16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+            const uint8_t *sc = b + 4, *qs = b + 16;
+            for (int j = 0; j < 8; j++) {
+                uint8_t s6, m6; get_scale_min_k4(j, sc, &s6, &m6);
+                int sub = blk * 8 + j;
+                const uint8_t *qsp = qs + (j >> 1) * 32;
+                const int8_t  *qab = qa + (size_t)sub * 32;
+                int32_t dot = 0;
+                if (j & 1) for (int l = 0; l < 32; l++) dot += (int32_t)(qsp[l] >> 4)   * qab[l];
+                else       for (int l = 0; l < 32; l++) dot += (int32_t)(qsp[l] & 0x0F) * qab[l];
+                acc += da[sub] * (d * (float)s6 * (float)dot
+                                - dmin * (float)m6 * (float)as[sub]);
+            }
+        }
+        out[row] = acc;
+    }
+}
+#endif
+
 typedef void (*pq_i8_fn)(float *, const uint8_t *, const int8_t *, const float *, const int32_t *, int, int, int);
 typedef struct { pq_i8_fn fn; float *out; const uint8_t *Wq; const int8_t *qa; const float *da; const int32_t *as; int c; } PQI8Ctx;
 static void pq_i8_range(void *ctx, int r0, int r1) {
@@ -1623,9 +1704,10 @@ static int pq_qcache_get(const float *x, int c, int8_t **qa_out, float **da_out,
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
     pq_i8_fn kern = (dt == 2)  ? pq_q4_0_rows_i8
                   : (dt == 8)  ? pq_q8_0_rows_i8
+                  : (dt == 12) ? pq_q4_k_rows_i8
                   : (dt == 14) ? pq_q6_k_rows_i8 : NULL;
     if (!kern || (c%32)) return -1;
-    if (dt == 14 && (c%256)) return -1;          /* Q6_K blocks are 256 values wide */
+    if ((dt == 12 || dt == 14) && (c%256)) return -1;   /* K-quant blocks are 256 wide */
     int8_t *qa; float *da; const int32_t *as;
     if (pq_qcache_get(x, c, &qa, &da, &as) < 0) return -1;
     /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
