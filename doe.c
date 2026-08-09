@@ -1470,6 +1470,103 @@ static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
 }
 #endif
 
+/* Q6_K int8-dot rows: 210 B per 256 values. Ported from notorch nt_q6_k_rows_i8.
+ *
+ * Why this shape needed its own kernel: the stock Qwen2.5 GGUF stores lm_head as Q6_K,
+ * and dtype 14 was rejected by the int8 dispatch, so the largest matvec in the model
+ * fell to the exact dequant-inline path and took 63% of decode by itself (73.3 ms/tok
+ * measured on an Exynos 1580, against 12 ms for the same shape stored Q8_0).
+ *
+ * The two block grids line up, which is what makes this exact by sub-block: a weight
+ * sub-scale covers 16 values, an activation block covers 32, and 16j..16j+15 always sits
+ * inside activation block j/2 rather than straddling it. So the integer accumulator is
+ * per weight sub-block and d * sc[j] * da[j/2] is applied once after it, never per value.
+ * Q6 lands in [-32,31] after its bias, which is signed int8, so SDOT applies directly. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void pq_q6_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    (void)as;
+    int nb = c / 256;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F), m3 = vdupq_n_u8(3);
+    const int8x16_t  b32 = vdupq_n_s8(32);
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (size_t)row * nb * 210;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (size_t)blk * 210, *ql = b, *qh = b + 128;
+            const int8_t *sc = (const int8_t *)(b + 192);
+            float d = f16_to_f32((uint16_t)(b[208] | (b[209] << 8)));
+            const int8_t *qab = qa + (size_t)blk * 256;
+            const float  *dab = da + (size_t)blk * 8;
+            int32_t ssum[16];
+            for (int n = 0; n < 256; n += 128) {
+                const uint8_t *qlh = ql + (n / 128) * 64, *qhh = qh + (n / 128) * 32;
+                int base = (n / 128) * 8;
+                for (int is = 0; is < 2; is++) {
+                    uint8x16_t la = vld1q_u8(qlh + is * 16);
+                    uint8x16_t lb = vld1q_u8(qlh + 32 + is * 16);
+                    uint8x16_t hv = vld1q_u8(qhh + is * 16);
+                    int8x16_t w1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(la, m4), vshlq_n_u8(vandq_u8(hv, m3), 4))), b32);
+                    int8x16_t w2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(lb, m4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hv, 2), m3), 4))), b32);
+                    int8x16_t w3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(la, 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(hv, 4), m3), 4))), b32);
+                    int8x16_t w4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8(lb, 4), vshlq_n_u8(vshrq_n_u8(hv, 6), 4))), b32);
+                    const int8_t *x = qab + n + is * 16;
+                    const int32x4_t z = vdupq_n_s32(0);
+                    ssum[base + is + 0] = vaddvq_s32(vdotq_s32(z, w1, vld1q_s8(x)));
+                    ssum[base + is + 2] = vaddvq_s32(vdotq_s32(z, w2, vld1q_s8(x + 32)));
+                    ssum[base + is + 4] = vaddvq_s32(vdotq_s32(z, w3, vld1q_s8(x + 64)));
+                    ssum[base + is + 6] = vaddvq_s32(vdotq_s32(z, w4, vld1q_s8(x + 96)));
+                }
+            }
+            for (int j = 0; j < 16; j++)
+                acc += d * (float)sc[j] * dab[j / 2] * (float)ssum[j];
+        }
+        out[row] = acc;
+    }
+}
+#else
+static void pq_q6_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    (void)as;
+    int nb = c / 256;
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (size_t)row * nb * 210;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (size_t)blk * 210, *ql = b, *qh = b + 128;
+            const int8_t *sc = (const int8_t *)(b + 192);
+            float d = f16_to_f32((uint16_t)(b[208] | (b[209] << 8)));
+            const int8_t *qab = qa + (size_t)blk * 256;
+            const float  *dab = da + (size_t)blk * 8;
+            int32_t ssum[16];
+            for (int j = 0; j < 16; j++) ssum[j] = 0;
+            for (int n = 0; n < 256; n += 128) {
+                const uint8_t *qlh = ql + (n / 128) * 64, *qhh = qh + (n / 128) * 32;
+                int base = (n / 128) * 8;
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    int q1 = (int)((qlh[l]      & 0x0F) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int)((qlh[l + 32] & 0x0F) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((qlh[l]      >> 4)   | (((qhh[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((qlh[l + 32] >> 4)   | (((qhh[l] >> 6) & 3) << 4)) - 32;
+                    ssum[base + is + 0] += q1 * (int)qab[n + l];
+                    ssum[base + is + 2] += q2 * (int)qab[n + l + 32];
+                    ssum[base + is + 4] += q3 * (int)qab[n + l + 64];
+                    ssum[base + is + 6] += q4 * (int)qab[n + l + 96];
+                }
+            }
+            for (int j = 0; j < 16; j++)
+                acc += d * (float)sc[j] * dab[j / 2] * (float)ssum[j];
+        }
+        out[row] = acc;
+    }
+}
+#endif
+
 typedef void (*pq_i8_fn)(float *, const uint8_t *, const int8_t *, const float *, const int32_t *, int, int, int);
 typedef struct { pq_i8_fn fn; float *out; const uint8_t *Wq; const int8_t *qa; const float *da; const int32_t *as; int c; } PQI8Ctx;
 static void pq_i8_range(void *ctx, int r0, int r1) {
@@ -1524,8 +1621,11 @@ static int pq_qcache_get(const float *x, int c, int8_t **qa_out, float **da_out,
 }
 
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
-    pq_i8_fn kern = (dt == 2) ? pq_q4_0_rows_i8 : (dt == 8) ? pq_q8_0_rows_i8 : NULL;
+    pq_i8_fn kern = (dt == 2)  ? pq_q4_0_rows_i8
+                  : (dt == 8)  ? pq_q8_0_rows_i8
+                  : (dt == 14) ? pq_q6_k_rows_i8 : NULL;
     if (!kern || (c%32)) return -1;
+    if (dt == 14 && (c%256)) return -1;          /* Q6_K blocks are 256 values wide */
     int8_t *qa; float *da; const int32_t *as;
     if (pq_qcache_get(x, c, &qa, &da, &as) < 0) return -1;
     /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
