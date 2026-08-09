@@ -1361,33 +1361,75 @@ static int doe_qmatvec(float *out, const uint8_t *Wq, int dt, const float *x, in
 }
 
 /* int8 dynamic-activation-quant fast path (Q4_0), NEON SDOT / scalar. APPROXIMATE. */
-static void pq_quant_act_q8(const float *x, int c, int8_t *qa, float *da) {
+/* Also emits the per-block sum of the quantized activation. Q4_0 stores weights as
+ * unsigned nibbles biased by 8, and SUM((w-8)*x) == SUM(w*x) - 8*SUM(x), so having
+ * SUM(x) per block lets the row kernel drop two vsubq_s8 per block and apply the bias
+ * once, to an integer, before it becomes a float. The identity is exact. */
+static void pq_quant_act_q8(const float *x, int c, int8_t *qa, float *da, int32_t *asum) {
     int nb=c/32;
     for (int b=0;b<nb;b++) { const float *xb=x+(size_t)b*32; float amax=0;
         for (int i=0;i<32;i++){ float v=fabsf(xb[i]); if(v>amax)amax=v; }
         float d=amax/127.0f, id=(d>0)?1.0f/d:0.0f; da[b]=d;
-        for (int i=0;i<32;i++){ int q=(int)lrintf(xb[i]*id); if(q>127)q=127; else if(q<-127)q=-127; qa[(size_t)b*32+i]=(int8_t)q; } }
+        int32_t t=0;
+        for (int i=0;i<32;i++){ int q=(int)lrintf(xb[i]*id); if(q>127)q=127; else if(q<-127)q=-127;
+            qa[(size_t)b*32+i]=(int8_t)q; t+=q; }
+        asum[b]=t; }
 }
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
-static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
-    int nb=c/32; const uint8x16_t m0f=vdupq_n_u8(0x0F); const int8x16_t e8=vdupq_n_s8(8);
-    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
-        for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
+/* Two costs left this kernel, and neither moves a bit of the result.
+ *
+ * The bias: the old loop subtracted 8 from all 32 lanes with two vsubq_s8 per block.
+ * SUM((w-8)*x) is SUM(w*x) - 8*SUM(x), and SUM(x) per block now arrives with the
+ * quantized activation, so the correction is one integer multiply-subtract instead. The
+ * raw nibble is [0,15], representable as signed int8, so SDOT takes it directly.
+ *
+ * The drain: vaddvq_s32 is a full horizontal reduction sitting in the dependency chain,
+ * once per 32 values. Four blocks are retired together now and their four sums fall out
+ * of two vpaddq_s32 — a pairwise add, not a reduction. The float accumulation order is
+ * deliberately unchanged, still block by block ascending, which is what keeps this
+ * bit-identical to the loop it replaces. */
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    int nb=c/32; const uint8x16_t m0f=vdupq_n_u8(0x0F);
+    for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0; int b=0;
+        for (; b+4<=nb; b+=4) {
+            int32x4_t s0,s1,s2,s3; float dv[4]; int32x4_t *sp[4]={&s0,&s1,&s2,&s3};
+            for (int j=0;j<4;j++) {
+                const uint8_t *bl=rb+(size_t)(b+j)*18; dv[j]=f16_to_f32(bl[0]|(bl[1]<<8));
+                const int8_t *qab=qa+(size_t)(b+j)*32; uint8x16_t pk=vld1q_u8(bl+2);
+                int8x16_t lo=vreinterpretq_s8_u8(vandq_u8(pk,m0f));
+                int8x16_t hi=vreinterpretq_s8_u8(vshrq_n_u8(pk,4));
+                int32x4_t t=vdupq_n_s32(0);
+                t=vdotq_s32(t,lo,vld1q_s8(qab)); t=vdotq_s32(t,hi,vld1q_s8(qab+16));
+                *sp[j]=t;
+            }
+            int32_t sums[4]; vst1q_s32(sums, vpaddq_s32(vpaddq_s32(s0,s1), vpaddq_s32(s2,s3)));
+            a += dv[0]*da[b+0]*(float)(sums[0]-8*as[b+0]);
+            a += dv[1]*da[b+1]*(float)(sums[1]-8*as[b+1]);
+            a += dv[2]*da[b+2]*(float)(sums[2]-8*as[b+2]);
+            a += dv[3]*da[b+3]*(float)(sums[3]-8*as[b+3]);
+        }
+        for (; b<nb; b++) {
+            const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
             const int8_t *qab=qa+(size_t)b*32; uint8x16_t pk=vld1q_u8(bl+2);
-            int8x16_t lo=vsubq_s8(vreinterpretq_s8_u8(vandq_u8(pk,m0f)),e8), hi=vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),e8);
-            int32x4_t s=vdupq_n_s32(0); s=vdotq_s32(s,lo,vld1q_s8(qab)); s=vdotq_s32(s,hi,vld1q_s8(qab+16));
-            a += d*da[b]*(float)vaddvq_s32(s); }
+            int8x16_t lo=vreinterpretq_s8_u8(vandq_u8(pk,m0f));
+            int8x16_t hi=vreinterpretq_s8_u8(vshrq_n_u8(pk,4));
+            int32x4_t t=vdupq_n_s32(0);
+            t=vdotq_s32(t,lo,vld1q_s8(qab)); t=vdotq_s32(t,hi,vld1q_s8(qab+16));
+            a += d*da[b]*(float)(vaddvq_s32(t)-8*as[b]);
+        }
         out[row]=a; }
 }
 #else
-static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
     int nb=c/32;
     for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*18; float a=0;
         for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*18; float d=f16_to_f32(bl[0]|(bl[1]<<8));
             const int8_t *qab=qa+(size_t)b*32; int32_t s=0;
-            for (int i=0;i<16;i++){ int lo=(int)(bl[2+i]&0x0F)-8, hi=(int)(bl[2+i]>>4)-8; s+=lo*qab[i]; s+=hi*qab[i+16]; }
-            a += d*da[b]*(float)s; }
+            for (int i=0;i<16;i++){ s += (int)(bl[2+i]&0x0F)*qab[i]; s += (int)(bl[2+i]>>4)*qab[i+16]; }
+            a += d*da[b]*(float)(s-8*as[b]); }
         out[row]=a; }
 }
 #endif
@@ -1402,7 +1444,9 @@ static void pq_q4_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
  * were reading weights at 12-13 GB/s — the memory ceiling of this device — while
  * lm_head crawled at 4.3 GB/s and took 48% of decode on its own. */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    (void)as;                       /* Q8_0 has no bias to correct */
     int nb=c/32;
     for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
         for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
@@ -1413,7 +1457,9 @@ static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
         out[row]=a; }
 }
 #else
-static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da, int r0, int r1, int c) {
+static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, const float *da,
+                            const int32_t *as, int r0, int r1, int c) {
+    (void)as;                       /* Q8_0 has no bias to correct */
     int nb=c/32;
     for (int row=r0; row<r1; row++) { const uint8_t *rb=W+(size_t)row*nb*34; float a=0;
         for (int b=0;b<nb;b++) { const uint8_t *bl=rb+(size_t)b*34; float d=f16_to_f32(bl[0]|(bl[1]<<8));
@@ -1424,10 +1470,10 @@ static void pq_q8_0_rows_i8(float *out, const uint8_t *W, const int8_t *qa, cons
 }
 #endif
 
-typedef void (*pq_i8_fn)(float *, const uint8_t *, const int8_t *, const float *, int, int, int);
-typedef struct { pq_i8_fn fn; float *out; const uint8_t *Wq; const int8_t *qa; const float *da; int c; } PQI8Ctx;
+typedef void (*pq_i8_fn)(float *, const uint8_t *, const int8_t *, const float *, const int32_t *, int, int, int);
+typedef struct { pq_i8_fn fn; float *out; const uint8_t *Wq; const int8_t *qa; const float *da; const int32_t *as; int c; } PQI8Ctx;
 static void pq_i8_range(void *ctx, int r0, int r1) {
-    PQI8Ctx *w = (PQI8Ctx *)ctx; w->fn(w->out, w->Wq, w->qa, w->da, r0, r1, w->c);
+    PQI8Ctx *w = (PQI8Ctx *)ctx; w->fn(w->out, w->Wq, w->qa, w->da, w->as, r0, r1, w->c);
 }
 
 /* Quantized-activation scratch, reused across calls.
@@ -1447,47 +1493,49 @@ static void pq_i8_range(void *ctx, int r0, int r1) {
  * Thread-local because the caller-parallel entry may dispatch matvecs from several
  * threads; per-thread scratch removes the question rather than answering it. */
 typedef struct {
-    float  *x;      /* copy of the activation these tables were built from */
-    int8_t *qa;
-    float  *da;
+    float   *x;     /* copy of the activation these tables were built from */
+    int8_t  *qa;
+    float   *da;
+    int32_t *as;    /* per-block sum of qa — the Q4_0 bias correction */
     int cap_c, c, valid;
 } pq_qcache_t;
-static __thread pq_qcache_t g_qc = { NULL, NULL, NULL, 0, 0, 0 };
+static __thread pq_qcache_t g_qc = { NULL, NULL, NULL, NULL, 0, 0, 0 };
 
-static int pq_qcache_get(const float *x, int c, int8_t **qa_out, float **da_out) {
+static int pq_qcache_get(const float *x, int c, int8_t **qa_out, float **da_out, const int32_t **as_out) {
     int nb = c / 32;
     if (g_qc.valid && g_qc.c == c && memcmp(g_qc.x, x, (size_t)c * sizeof(float)) == 0) {
-        *qa_out = g_qc.qa; *da_out = g_qc.da; return 1;          /* hit — same vector */
+        *qa_out = g_qc.qa; *da_out = g_qc.da; *as_out = g_qc.as; return 1;   /* same vector */
     }
     if (c > g_qc.cap_c) {
-        float  *nx = (float *)realloc(g_qc.x,  (size_t)c * sizeof(float));
-        int8_t *nq = (int8_t *)realloc(g_qc.qa, (size_t)c);
-        float  *nd = (float *)realloc(g_qc.da, (size_t)nb * sizeof(float));
-        if (!nx || !nq || !nd) {                                  /* keep what survived */
-            if (nx) g_qc.x = nx; if (nq) g_qc.qa = nq; if (nd) g_qc.da = nd;
+        float   *nx = (float *)realloc(g_qc.x,  (size_t)c * sizeof(float));
+        int8_t  *nq = (int8_t *)realloc(g_qc.qa, (size_t)c);
+        float   *nd = (float *)realloc(g_qc.da, (size_t)nb * sizeof(float));
+        int32_t *ns = (int32_t *)realloc(g_qc.as, (size_t)nb * sizeof(int32_t));
+        if (!nx || !nq || !nd || !ns) {                            /* keep what survived */
+            if (nx) g_qc.x = nx; if (nq) g_qc.qa = nq; if (nd) g_qc.da = nd; if (ns) g_qc.as = ns;
             g_qc.valid = 0; return -1;
         }
-        g_qc.x = nx; g_qc.qa = nq; g_qc.da = nd; g_qc.cap_c = c;
+        g_qc.x = nx; g_qc.qa = nq; g_qc.da = nd; g_qc.as = ns; g_qc.cap_c = c;
     }
     memcpy(g_qc.x, x, (size_t)c * sizeof(float));
-    pq_quant_act_q8(x, c, g_qc.qa, g_qc.da);
+    pq_quant_act_q8(x, c, g_qc.qa, g_qc.da, g_qc.as);
     g_qc.c = c; g_qc.valid = 1;
-    *qa_out = g_qc.qa; *da_out = g_qc.da; return 0;
+    *qa_out = g_qc.qa; *da_out = g_qc.da; *as_out = g_qc.as; return 0;
 }
 
 static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x, int r, int c) {
     pq_i8_fn kern = (dt == 2) ? pq_q4_0_rows_i8 : (dt == 8) ? pq_q8_0_rows_i8 : NULL;
     if (!kern || (c%32)) return -1;
-    int8_t *qa; float *da;
-    if (pq_qcache_get(x, c, &qa, &da) < 0) return -1;
+    int8_t *qa; float *da; const int32_t *as;
+    if (pq_qcache_get(x, c, &qa, &da, &as) < 0) return -1;
     /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
      * single core regardless of --threads, which is why the int8 "fast path" measured
      * slower than it should. It threads like its f32 twin now. */
     int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
     if (nt <= 1 || (long)r*c < (1L<<20)) {
-        kern(out, Wq, qa, da, 0, r, c);
+        kern(out, Wq, qa, da, as, 0, r, c);
     } else {
-        PQI8Ctx ctx = { kern, out, Wq, qa, da, c };
+        PQI8Ctx ctx = { kern, out, Wq, qa, da, as, c };
         pq_run(pq_i8_range, &ctx, r, nt);
     }
     return 0;                                   /* scratch is owned by the cache */
