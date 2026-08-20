@@ -1883,7 +1883,7 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
     if ((dt == 12 || dt == 14) && (c%256)) return -1;   /* K-quant blocks are 256 wide */
     int8_t *qa; float *da; const int32_t *as;
     if (pq_qcache_get(x, c, &qa, &da, &as) < 0) return -1;
-    /* This path had no threading at all: DOE_INT8=1 sent every Q4_0 matvec down a
+    /* This path had no threading at all: the int8 route sent every Q4_0 matvec down a
      * single core regardless of --threads, which is why the int8 "fast path" measured
      * slower than it should. It threads like its f32 twin now. */
     int nt = g_n_threads; if (nt < 1) nt = 1; if (nt > 32) nt = 32; if (nt > r) nt = r;
@@ -1898,8 +1898,10 @@ static int doe_qmatvec_i8(float *out, const uint8_t *Wq, int dt, const float *x,
 
 /* matvec dispatch: packed weight (dt != 0) -> doe_qmatvec (inline dequant);
  * else the existing f32 matvec. The one call the forward uses for host weights.
- * DOE_INT8=1 opts the Q4_0 weights into the int8 dynamic-activation-quant fast path
- * (doe_qmatvec_i8, NEON SDOT) — APPROXIMATE; default is the exact dequant-inline path. */
+ * The int8 dynamic-activation-quant path (doe_qmatvec_i8, NEON SDOT) is the default:
+ * on a phone it decodes 22.57 t/s against 5.29 on the exact dequant-inline path, and
+ * greedy output was token-identical across arithmetic, recall and translation prompts.
+ * It stays approximate, so DOE_INT8=0 returns to the exact path when a run needs it. */
 static int g_doe_int8 = -1;
 static double g_prof_mv_ns = 0; static int g_prof_on = -1; /* DOE_PROFILE: matvec share of decode */
 static double g_resident_ns = 0, g_head_ns = 0;  /* DOE_PROFILE: resident CB vs lm_head split */
@@ -1943,7 +1945,7 @@ static void doe_mv_impl(float *out, const float *W, int dt, const float *x, int 
             return;
         }
 #endif
-        if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='1') ? 1 : 0; }
+        if (g_doe_int8 < 0) { const char *e = getenv("DOE_INT8"); g_doe_int8 = (e && e[0]=='0') ? 0 : 1; }
         if (g_doe_int8 && doe_qmatvec_i8(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
         if (doe_qmatvec(out, (const uint8_t*)W, dt, x, r, c) == 0) return;
         /* D-M6: packed dtype but qmatvec failed — never fall through to matvec(),

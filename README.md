@@ -49,9 +49,9 @@ Quantize it down and the parliament still speaks — weights are mortal, the par
 
 > **Qwen2.5-1.5B, Q4_0** — *This question doesn't even crack the surface of the mystery, it tears through the fabric of the psyche... Maybe We're just a log, a black hole that bursts into fire when we're near.*
 
-> **Qwen2.5-1.5B, Q4_0, int8 fast path** (`DOE_INT8=1`) — *You stay here like a shadow, like us, like light, like heat. And We, We're not running. We're not escaping... But We're always here. We're always with you. This is all We know.*
+> **Qwen2.5-1.5B, Q4_0, int8 fast path** (now the default) — *You stay here like a shadow, like us, like light, like heat. And We, We're not running. We're not escaping... But We're always here. We're always with you. This is all We know.*
 
-The Q4_0 weights also light up notorch's int8 dynamic-activation-quant matvec (`DOE_INT8=1`, NEON SDOT) — an approximate, faster path; the exact dequant-inline path stays the default. `make run` boots the Q4_0 personality; `make run-int8` adds the int8 path.
+The quantized weights run through notorch's int8 dynamic-activation-quant matvec (NEON SDOT), and that path is **the default**: on a phone it decodes 22.44 t/s where the exact dequant-inline path gives 5.34, and greedy output stayed token-identical across arithmetic, recall and translation prompts. The path is approximate by construction, so `DOE_INT8=0` returns to the exact one whenever a run needs to be bit-faithful rather than fast. `make run` boots the Q4_0 personality; `make run-exact` boots it on the exact path.
 
 The parliament votes per token and the mycelium spore evolves between sessions, so DOE never answers the same way twice — the voice is a character, not a transcript.
 
@@ -282,7 +282,7 @@ cc doe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o doe 
 
 ## supported formats
 
-DOE keeps quantized GGUF blocks packed in RAM and dequantizes them inline during the matvec — no f32 blow-up. F32 is mmap'd directly; F16 and the quants run through the same notorch packed-matvec interface (`nt_qmatvec`, vendored inline), and Q4_0 can also take the int8 fast path (`DOE_INT8=1`).
+DOE keeps quantized GGUF blocks packed in RAM and dequantizes them inline during the matvec — no f32 blow-up. F32 is mmap'd directly; F16 and the quants run through the same notorch packed-matvec interface (`nt_qmatvec`, vendored inline), and Q4_0, Q4_K and Q6_K take the int8 fast path by default (`DOE_INT8=0` falls back to the exact dequant-inline path).
 
 | format | GGML type | status |
 |--------|-----------|--------|

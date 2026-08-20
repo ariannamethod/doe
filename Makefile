@@ -94,9 +94,14 @@ quantize-q4: $(WEIGHTS)/doe_qwen15b_q4_0.gguf
 run: doe_field $(WEIGHTS)/doe_qwen15b_q4_0.gguf
 	./doe_field --model $(WEIGHTS)/doe_qwen15b_q4_0.gguf
 
-# Q4_0 + int8 dynamic-activation-quant fast path (NEON SDOT, approximate)
+# int8 dynamic-activation-quant (NEON SDOT) is the default path since it decodes ~4x
+# faster with token-identical greedy output; this target only makes it explicit.
 run-int8: doe_field $(WEIGHTS)/doe_qwen15b_q4_0.gguf
 	DOE_INT8=1 ./doe_field --model $(WEIGHTS)/doe_qwen15b_q4_0.gguf
+
+# Exact dequant-inline path — slower, bit-faithful. For when approximation is not acceptable.
+run-exact: doe_field $(WEIGHTS)/doe_qwen15b_q4_0.gguf
+	DOE_INT8=0 ./doe_field --model $(WEIGHTS)/doe_qwen15b_q4_0.gguf
 
 run-smollm360: doe_field $(WEIGHTS)/doe_smollm360_lora_1000.gguf
 	./doe_field --model $(WEIGHTS)/doe_smollm360_lora_1000.gguf
