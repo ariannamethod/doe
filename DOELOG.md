@@ -14,6 +14,30 @@ Newest entries on top.
 
 ---
 
+## 2026-08-21 — thread default reads the affinity mask, not the online core count
+
+`g_n_threads` fell back to `sysconf(_SC_NPROCESSORS_ONLN)` (`doe.c:5328`), which counts
+the cores the kernel has online rather than the cores this process is allowed to run on.
+Every phone measurement pins to the big cluster, and there the online count answered 8
+while four cores were usable, so the matvec pool oversubscribed two to one and each
+dispatch ended up waiting on a context switch. `doe_host_threads()` (`doe.c:1110`) now
+reads `sched_getaffinity` and falls back to the online count wherever the call is
+unavailable — including inside `tests/test_doe.c`, which includes `doe.c` after its own
+libc headers and therefore never sees `CPU_COUNT`. `--threads` still wins over both.
+
+Measured on a Galaxy A56 (Exynos 1580, aarch64, Ubuntu chroot), `taskset 0xF0`,
+Qwen2.5-1.5B Q4_0, 200 decoded tokens, `DOE_DEBUG_TIMING=1` (`doe.c:4485`), two
+interleaved repeats:
+
+| threads | decode |
+|---------|--------|
+| default — affinity gives 4 | 20.14 s — **9.93 t/s** · 21.64 s — **9.24 t/s** |
+| `--threads 8` — the old default | 22.81 s — 8.77 t/s · 23.88 s — 8.37 t/s |
+
+`make test`: 113 passed, 0 failed.
+
+---
+
 ## 2026-08-20 — int8 dynamic-activation-quant path becomes the default
 
 `doe_mv_impl` selected the int8 matvec only when `DOE_INT8=1` was set in the

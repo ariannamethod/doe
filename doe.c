@@ -28,6 +28,12 @@
  * הרזוננס לא נשבר
  */
 
+/* sched_getaffinity sits behind _GNU_SOURCE on glibc; Bionic and musl expose it plain.
+ * The define has to precede the first libc header so features.h sees it. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1098,6 +1104,24 @@ static void *matvec_worker(void *arg) {
 
 static int g_n_threads = 0;
 static float g_rep_penalty = 1.0f; /* A10a: repetition penalty over generated history; 1.0 = off */
+
+/* Cores this process may actually run on, falling back to the online count where the
+ * affinity call is missing or refused. Read once — a mask does not move under us. */
+static int doe_host_threads(void) {
+    static int host = 0;
+    if (host) return host;
+/* CPU_COUNT is guarded by _GNU_SOURCE, which doe.c defines for its own translation unit.
+ * A consumer that #includes doe.c after its own libc headers — tests/test_doe.c does
+ * exactly that — gets here without the macro, and falls through to the online count. */
+#if defined(__linux__) && defined(CPU_COUNT)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) host = CPU_COUNT(&set);
+#endif
+    if (host < 1) host = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (host < 1) host = 1;
+    return host;
+}
 
 static void matvec(float *out, const float *W, const float *x, int r, int c) {
 #ifdef USE_CUBLAS
@@ -5297,7 +5321,11 @@ int main(int argc, char **argv) {
     }
 
     /* ── Thread count for matvec ── */
-    if (g_n_threads == 0) g_n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN); /* D-L1: respect --threads if the user set it */
+    /* D-L1: respect --threads if the user set it. Otherwise ask the affinity mask, not
+     * _SC_NPROCESSORS_ONLN: the latter counts the cores the kernel has online, and on a
+     * phone every serious run is pinned to the big cluster (taskset 0xF0), where the
+     * online count says 8 while four cores are usable and the pool oversubscribes 2:1. */
+    if (g_n_threads == 0) g_n_threads = doe_host_threads();
     if (g_n_threads < 1) g_n_threads = 1;
     if (g_n_threads > 32) g_n_threads = 32;
 
