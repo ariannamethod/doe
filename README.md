@@ -13,6 +13,8 @@
 ---
 # Democracy of Experts: Janus Architecture
 
+> **Read the [Arianna Method Manifesto](ARIANNA_METHOD_MANIFESTO.md) first.** This repository is governed by it; every instruction here, `CLAUDE.md` included, is subordinate to it.
+
 **A new kind of inference.** DOE is agnostic. DOE wraps any GGUF and makes it alive.
 
 ## what DOE does
